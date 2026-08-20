@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import subprocess
 import sys
@@ -8,6 +9,9 @@ from pathlib import Path
 from typing import Callable
 
 from app.services.subprocess_control import controlled_lines, terminate_process
+
+
+TRANSLATION_QC_REVISION = "blind-source-translation-and-english-gate-v3"
 
 
 def validate_translations(cues: list[dict], folder: Path,
@@ -22,7 +26,20 @@ def validate_translations(cues: list[dict], folder: Path,
         return cues
     manifest = folder / "translation-qc-manifest.json"
     output = folder / "translation-qc.json"
-    manifest.write_text(json.dumps({"model": str(model), "cues": cues}, ensure_ascii=False), encoding="utf-8")
+    # Keep the prompt/evidence policy in the cache signature. A judge result from
+    # an older policy must never survive a semantic-QC upgrade.
+    manifest_value = {"model": str(model), "judge_revision": TRANSLATION_QC_REVISION, "cues": cues}
+    manifest_text = json.dumps(manifest_value, ensure_ascii=False, sort_keys=True)
+    signature = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+    signature_path = folder / "translation-qc-input.sha256"
+    prior_signature = (signature_path.read_text(encoding="utf-8").strip()
+                       if signature_path.is_file() else "")
+    if prior_signature and prior_signature != signature:
+        output.unlink(missing_ok=True)
+    # A partial result created by the immediately preceding worker predates the
+    # signature sidecar; adopt it once. Future cue edits invalidate it exactly.
+    signature_path.write_text(signature, encoding="utf-8")
+    manifest.write_text(manifest_text, encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, "-m", "app.services.translation_qc_worker", "--manifest", str(manifest),
          "--output", str(output)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,

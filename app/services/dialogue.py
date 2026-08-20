@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import subprocess
 
 import numpy as np
 import soundfile as sf
@@ -194,3 +195,105 @@ def measure_dialogue_leakage(cues: list[dict], dialogue_audio: Path,
             correlation = abs(float(np.dot(left, right) / (np.linalg.norm(left) * np.linalg.norm(right) + 1e-9)))
             level = min(1.0, rms(right) / max(rms(left), 1e-6))
             cue["dialogue_leakage"] = round(correlation * level, 3)
+
+
+def suppress_dialogue_leakage(cues: list[dict], dialogue_audio: Path,
+                              background_audio: Path | None, output: Path) -> Path | None:
+    """Remove source-correlated speech residue from the inferred M&E bed.
+
+    This is deliberately streaming so a feature film never enters RAM.  Linear
+    source projection removes correlated separator bleed; high-leakage spans
+    that are not linearly recoverable receive a conservative local attenuation.
+    Music and effects outside aligned speech spans are bit-for-bit untouched at
+    the sample-processing level.
+    """
+    if not background_audio or not background_audio.is_file():
+        return background_audio
+    output.parent.mkdir(parents=True, exist_ok=True)
+    version = output.with_suffix(output.suffix + ".version")
+    if output.is_file() and version.is_file() and version.read_text(encoding="utf-8").strip() == "2":
+        return output
+    with sf.SoundFile(background_audio) as bed:
+        rate, channels = bed.samplerate, bed.channels
+    aligned_dialogue = output.with_suffix(".dialogue-aligned.wav")
+    subprocess.run([
+        "ffmpeg", "-y", "-v", "error", "-i", str(dialogue_audio), "-ar", str(rate),
+        "-ac", "1", "-c:a", "pcm_f32le", str(aligned_dialogue),
+    ], check=True)
+    spans: list[tuple[int, int, int]] = []
+    for cue_index, cue in enumerate(cues):
+        words = [(float(word["start"]), float(word["end"])) for word in cue.get("words", [])
+                 if word.get("start") is not None and word.get("end") is not None]
+        if not words:
+            words = [(float(cue["start"]), float(cue["end"]))]
+        for start, end in words:
+            left = max(0, round((start - .04) * rate))
+            right = max(left, round((end + .04) * rate))
+            if right > left:
+                spans.append((left, right, cue_index))
+    spans.sort()
+    chunk_frames = rate * 20
+    cursor = 0
+    cue_reduction: dict[int, list[float]] = {}
+    temporary = output.with_suffix(output.suffix + ".tmp.flac")
+    try:
+        with sf.SoundFile(background_audio) as bed, sf.SoundFile(aligned_dialogue) as dialogue, sf.SoundFile(
+            temporary, "w", samplerate=rate, channels=channels, format="FLAC", subtype="PCM_24"
+        ) as writer:
+            while True:
+                values = bed.read(chunk_frames, dtype="float32", always_2d=True)
+                if not len(values):
+                    break
+                speech = dialogue.read(len(values), dtype="float32", always_2d=True).mean(axis=1)
+                if len(speech) < len(values):
+                    speech = np.pad(speech, (0, len(values) - len(speech)))
+                chunk_end = cursor + len(values)
+                for left, right, cue_index in spans:
+                    if right <= cursor:
+                        continue
+                    if left >= chunk_end:
+                        break
+                    local_left = max(0, left - cursor); local_right = min(len(values), right - cursor)
+                    if local_right - local_left < 64:
+                        continue
+                    source = speech[local_left:local_right]
+                    source = source - float(np.mean(source))
+                    source_energy = float(np.dot(source, source)) + 1e-10
+                    fade = min(round(.025 * rate), (local_right - local_left) // 3)
+                    envelope = np.ones(local_right - local_left, dtype=np.float32)
+                    if fade:
+                        envelope[:fade] = np.linspace(0, 1, fade, dtype=np.float32)
+                        envelope[-fade:] = np.linspace(1, 0, fade, dtype=np.float32)
+                    reductions = []
+                    for channel in range(channels):
+                        bed_segment = values[local_left:local_right, channel]
+                        centered = bed_segment - float(np.mean(bed_segment))
+                        beta = float(np.dot(centered, source) / source_energy)
+                        correlation = abs(float(np.dot(centered, source) /
+                            (np.linalg.norm(centered) * np.linalg.norm(source) + 1e-10)))
+                        cleaned = bed_segment - np.clip(beta, -1.5, 1.5) * source
+                        leakage = float(cues[cue_index].get("dialogue_leakage", 0.0))
+                        if correlation < .06 and leakage > .16:
+                            cleaned *= .35
+                            reductions.append(9.1)
+                        else:
+                            before = float(np.sqrt(np.mean(bed_segment * bed_segment) + 1e-12))
+                            after = float(np.sqrt(np.mean(cleaned * cleaned) + 1e-12))
+                            reductions.append(max(0.0, 20 * np.log10(before / max(after, 1e-8))))
+                        values[local_left:local_right, channel] = (
+                            bed_segment * (1 - envelope) + cleaned * envelope
+                        )
+                    cue_reduction.setdefault(cue_index, []).append(max(reductions, default=0.0))
+                writer.write(np.clip(values, -1, 1))
+                cursor = chunk_end
+        temporary.replace(output)
+        version.write_text("2", encoding="utf-8")
+    finally:
+        aligned_dialogue.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+    for index, cue in enumerate(cues):
+        reduction = max(cue_reduction.get(index, [0.0]))
+        cue["dialogue_leakage_suppression_db"] = round(reduction, 2)
+        cue["dialogue_leakage_after_suppression"] = round(
+            float(cue.get("dialogue_leakage", 0.0)) * 10 ** (-reduction / 20), 3)
+    return output

@@ -4,9 +4,9 @@ import argparse
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
+from app.services.tts_worker import line_cooldown
 from app.services.tts import ContextEmotionAnalyzer
 
 
@@ -24,7 +24,7 @@ def main() -> None:
         args.output.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
         print(json.dumps({"progress": (index + 1) / max(1, len(contexts)), "index": index}), flush=True)
         if not manifest.get("preview", False):
-            time.sleep(max(0.0, float(os.getenv("DUB_GPU_LINE_COOLDOWN_SECONDS", ".45"))))
+            line_cooldown()
     # PyTorch/Transformers finalizers have caused torch_cpu.dll access violations on
     # Windows after moving Qwen between CPU and CUDA. The worker owns the process, so
     # an immediate successful exit is the deterministic and safe teardown boundary.

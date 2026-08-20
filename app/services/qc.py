@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -40,7 +41,7 @@ def backtranscribe_lines(cues: list[dict], fitted_dir: Path, folder: Path,
     output = folder / "qc-backtranscription.json"
     items = [{"audio": str(fitted_dir / f"{index:06d}.wav")} for index in range(1, len(cues) + 1)]
     manifest.write_text(json.dumps({"items": items,
-                                    "cache": str(Path(__import__('os').getenv("WHISPER_CACHE_DIR", "vendor/whisper")).resolve())},
+                                    "cache": str(Path(os.getenv("WHISPER_CACHE_DIR", "vendor/whisper")).resolve())},
                                    indent=2), encoding="utf-8")
     process = subprocess.Popen(
         [sys.executable, "-m", "app.services.qc_asr_worker", "--manifest", str(manifest), "--output", str(output)],
@@ -126,6 +127,76 @@ def _performance_metrics(audio: np.ndarray, rate: int) -> dict:
             "pause_ratio": round(pause_ratio, 3), "pitch_hz": round(pitch, 1)}
 
 
+# Register is identity, not style: a median pitch a few semitones from the actor
+# reads as a different person even when the timbre embedding matches.  These are
+# the shared tolerances for the QC gate, the retake trigger and the residual
+# pitch correction, kept in one place so they cannot drift apart.
+PITCH_TOLERANCE_SEMITONES = 3.5
+PITCH_SCORE_RANGE_SEMITONES = 6.0
+PERFORMANCE_RETAKE_THRESHOLD = 0.55
+# Residual register correction is a last resort applied only after retakes, and
+# only inside a band where formant-preserving shifting stays transparent.
+PITCH_CORRECTION_FLOOR_SEMITONES = 0.6
+PITCH_CORRECTION_CEILING_SEMITONES = 3.0
+
+
+def register_correction(cue: dict) -> tuple[float, float] | None:
+    """Return (semitones, pitch scale) to move a take toward the actor's register.
+
+    None whenever correction is unwarranted or unsafe: no reliable measurement on
+    either side, a line too short to have measured a stable median, a difference
+    small enough to be inaudible, or one large enough that shifting would cost
+    more in artefacts than it recovers in accuracy.
+    """
+    source = float((cue.get("source_performance") or {}).get("pitch_hz") or 0.0)
+    generated = float(((cue.get("qc") or {}).get("generated_performance") or {}).get("pitch_hz") or 0.0)
+    if source <= 0 or generated <= 0:
+        return None
+    if float(cue.get("end", 0)) - float(cue.get("start", 0)) < 1.0:
+        return None
+    semitones = 12 * math.log2(source / generated)
+    if not PITCH_CORRECTION_FLOOR_SEMITONES <= abs(semitones) <= PITCH_CORRECTION_CEILING_SEMITONES:
+        return None
+    return round(semitones, 2), source / generated
+
+
+def measure_performance_similarity(cues: list[dict], fitted_dir: Path) -> None:
+    """Measure acting-shape evidence early enough to select another take."""
+    for index, cue in enumerate(cues, 1):
+        path = fitted_dir / f"{index:06d}.wav"
+        source = cue.get("source_performance", {})
+        if not path.is_file() or not source:
+            continue
+        values, rate = sf.read(path, dtype="float32", always_2d=True)
+        generated = _performance_metrics(values.mean(axis=1), int(rate))
+        metrics = cue.setdefault("qc", {})
+        metrics["generated_performance"] = generated
+        components: list[tuple[float, float]] = []
+        source_contour = np.asarray(source.get("energy_contour", []), dtype=np.float32)
+        generated_contour = np.asarray(generated["energy_contour"], dtype=np.float32)
+        if len(source_contour) == len(generated_contour) and len(source_contour) >= 4:
+            if float(np.std(source_contour)) > .03 and float(np.std(generated_contour)) > .03:
+                similarity = float(np.corrcoef(source_contour, generated_contour)[0, 1])
+            else:
+                similarity = 1.0 - float(np.mean(np.abs(source_contour - generated_contour)))
+            similarity = float(np.clip(similarity, -1, 1))
+            metrics["energy_contour_similarity"] = round(similarity, 3)
+            components.append(((similarity + 1) / 2, .40))
+        if "pause_ratio" in source:
+            delta = abs(float(source["pause_ratio"]) - float(generated["pause_ratio"]))
+            metrics["pause_ratio_delta"] = round(delta, 3)
+            components.append((max(0.0, 1 - delta / .55), .20))
+        source_pitch, generated_pitch = float(source.get("pitch_hz", 0)), float(generated["pitch_hz"])
+        if source_pitch and generated_pitch:
+            delta = abs(12 * np.log2(generated_pitch / source_pitch))
+            metrics["pitch_delta_semitones"] = round(float(delta), 2)
+            components.append((max(0.0, 1 - delta / PITCH_SCORE_RANGE_SEMITONES), .40))
+        if components:
+            total_weight = sum(weight for _, weight in components)
+            metrics["performance_similarity"] = round(
+                sum(value * weight for value, weight in components) / total_weight, 3)
+
+
 def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
     flagged = 0
     for index, cue in enumerate(cues, 1):
@@ -133,7 +204,8 @@ def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
         metrics = cue.setdefault("qc", {})
         required_cue = ("speaker_confidence", "reference_quality", "timing_confidence",
                         "transcription_confidence", "adaptation_confidence", "alignment_confidence")
-        required_take = ("stretch_percent", "word_similarity", "wer", "cer", "backtranscription")
+        required_take = ("stretch_percent", "timing_pass", "padding_ms", "truncated_ms",
+                         "word_similarity", "wer", "cer", "backtranscription")
         for name in required_cue:
             if cue.get(name) is None:
                 reasons.append(f"QC evidence is missing: {name.replace('_', ' ')}")
@@ -160,12 +232,18 @@ def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
         timing_limit = 5.0 if cue.get("mouth_visible") else 8.0
         if stretch > timing_limit:
             reasons.append(f"timing correction {stretch:.1f}% exceeds {timing_limit:.0f}%")
+        if metrics.get("timing_pass") is False:
+            reasons.append("measured speech duration did not fit without excessive correction or dead air")
+        if float(metrics.get("padding_ms") or 0.0) > 160:
+            reasons.append("the take leaves excessive dead air after the spoken performance")
+        if float(metrics.get("truncated_ms") or 0.0) > 40:
+            reasons.append("the take was truncated to fit its timeline window")
         if (float(metrics.get("word_similarity") or 0.0) < 0.72
                 or (wer > 0.4 and cer > 0.35)):
             reasons.append("generated words disagree with the intended dialogue")
         if float(cue.get("speaker_confidence") or 0.0) < 0.5:
             reasons.append("speaker identity is uncertain")
-        if float(cue.get("reference_quality", 0.0)) < 0.001:
+        if float(cue.get("reference_quality", 0.0)) < 0.30:
             reasons.append("source voice reference is weak")
         if float(cue.get("timing_confidence") or 0.0) < 0.5:
             reasons.append("speech timing could not be aligned confidently")
@@ -178,9 +256,12 @@ def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
         if (float(metrics.get("speaker_similarity") or 0.0) < 0.55
                 and float(metrics.get("active_duration") or 0.0) >= 0.8):
             reasons.append("generated voice identity differs from the source reference")
+        if metrics.get("tts_engine", "").startswith("Qwen3") and metrics.get("full_reference_clone") is not True:
+            reasons.append("the fallback engine lacked a reference transcript and used reduced voice cloning")
         if float(cue.get("alignment_confidence") or 0.0) < 0.55:
             reasons.append("forced alignment confidence is low")
-        leakage = float(cue.get("dialogue_leakage", 0.0))
+        leakage = float(cue.get("dialogue_leakage_after_suppression",
+                                cue.get("dialogue_leakage", 0.0)))
         metrics["dialogue_leakage"] = round(leakage, 3)
         if leakage > .28:
             reasons.append("original dialogue may remain audible in the background bed")
@@ -220,8 +301,10 @@ def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
             if source_pitch and generated_pitch:
                 pitch_delta = abs(12 * np.log2(generated_pitch / source_pitch))
                 metrics["pitch_delta_semitones"] = round(float(pitch_delta), 2)
-                if pitch_delta > 10 and float(cue.get("end", 0)) - float(cue.get("start", 0)) >= 1.0:
-                    reasons.append("generated vocal pitch is far from the source performance")
+                if (pitch_delta > PITCH_TOLERANCE_SEMITONES
+                        and float(cue.get("end", 0)) - float(cue.get("start", 0)) >= 1.0):
+                    reasons.append(f"generated vocal pitch is {pitch_delta:.1f} semitones from the "
+                                   f"source performance")
             if peak >= 0.995:
                 reasons.append("line is at clipping threshold")
             if active < 0.08:
@@ -258,7 +341,7 @@ def media_qc(output: Path, expected_duration: float, source: Path | None = None,
     subtitle_count = sum(x.get("codec_type") == "subtitle" for x in streams)
     loudness_output = _controlled_capture(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(output), "-map", "0:a:0", "-af",
-         "loudnorm=I=-24:TP=-2:LRA=7:print_format=json", "-f", "null", "NUL"],
+         "loudnorm=I=-24:TP=-2:LRA=7:print_format=json", "-f", "null", os.devnull],
         checkpoint,
     )
     measured = {}
@@ -367,13 +450,57 @@ def evaluate_media_qc(media: dict, mastering: dict) -> list[str]:
     return failures
 
 
+def _value(value: float | None) -> str:
+    return "not measured" if value is None else f"{value:.3f}"
+
+
+def voice_fidelity_summary(cues: list[dict]) -> dict:
+    """Aggregate how closely the dub tracks each original voice, across every line.
+
+    The flagged-cue table only shows failures.  Fidelity is a property of the
+    whole dub, so the medians are reported over all measured lines.
+    """
+    def median(values: list[float]) -> float | None:
+        return round(float(np.median(values)), 3) if values else None
+
+    measured = [cue.get("qc") or {} for cue in cues]
+    identity = [float(item["speaker_similarity"]) for item in measured
+                if item.get("speaker_similarity") is not None]
+    performance = [float(item["performance_similarity"]) for item in measured
+                   if item.get("performance_similarity") is not None]
+    pitch = [float(item["pitch_delta_semitones"]) for item in measured
+             if item.get("pitch_delta_semitones") is not None]
+    verified = [cue for cue in cues if cue.get("source_asr_agreement") is not None]
+    return {
+        "lines": len(cues),
+        "source_lines_independently_verified": len(verified),
+        "source_lines_disputed": sum(1 for cue in cues if cue.get("source_asr_disputed")),
+        "median_source_asr_agreement": median(
+            [float(cue["source_asr_agreement"]) for cue in verified]),
+        "source_performance_lines": sum(
+            1 for cue in cues if str(cue.get("performance_source")) == "source performance"),
+        "median_speaker_similarity": median(identity),
+        "median_performance_similarity": median(performance),
+        "median_pitch_delta_semitones": median(pitch),
+        "lines_beyond_pitch_tolerance": sum(1 for value in pitch if value > PITCH_TOLERANCE_SEMITONES),
+        "lines_cloned_from_a_matched_take": sum(
+            1 for cue in cues if str(cue.get("reference_basis", "")).startswith("nearest take")),
+        "performance_retakes_kept": sum(1 for item in measured if item.get("performance_retake")),
+        "register_corrected_lines": sum(
+            1 for item in measured if item.get("pitch_correction_semitones") is not None),
+        "fallback_engine_lines": sum(1 for item in measured if item.get("tts_engine")),
+    }
+
+
 def write_report(folder: Path, job_id: str, cues: list[dict], cue_summary: dict,
                  media_summary: dict, separation: dict) -> tuple[Path, Path]:
     media_failures = list(media_summary.get("failures", []))
     result = "failed" if media_failures else ("needs_review" if cue_summary["flagged_count"] else "passed")
+    fidelity = voice_fidelity_summary(cues)
     report = {
-        "version": 2, "job_id": job_id, "result": result,
+        "version": 3, "job_id": job_id, "result": result,
         "cues": cue_summary, "media": media_summary, "separation": separation,
+        "voice_fidelity": fidelity,
         "flagged_cues": [
             {"id": cue.get("id"), "start": cue.get("start"), "end": cue.get("end"),
              "text": cue.get("english"), "reasons": cue.get("review_reasons", []), "metrics": cue.get("qc", {})}
@@ -400,6 +527,27 @@ def write_report(folder: Path, job_id: str, cues: list[dict], cue_summary: dict,
         f"{cue_summary['passed_count']} passed · {cue_summary['flagged_count']} need review</p>"
         f"<p>Output duration error: {media_summary['duration_error_ms']} ms · "
         f"audio tracks: {media_summary['audio_tracks']} · subtitles: {media_summary['subtitle_tracks']}</p>"
+        "<h2>Source transcript</h2>"
+        f"<p>{fidelity['source_lines_independently_verified']} of {fidelity['lines']} line(s) were read "
+        "by a second, independent transcriber before anything was translated; "
+        f"{fidelity['source_lines_disputed']} disagreed materially and carry both readings forward. "
+        f"Median agreement between the two models: {_value(fidelity['median_source_asr_agreement'])}.</p>"
+        "<h2>Voice fidelity</h2>"
+        f"<p>{fidelity['source_performance_lines']} of {fidelity['lines']} line(s) were voiced from the "
+        "original actor's own delivery of that line; the rest fell back to scene-context emotion.</p>"
+        "<table><thead><tr><th>Measure</th><th>Median</th></tr></thead><tbody>"
+        f"<tr><td>Speaker identity similarity</td><td>{_value(fidelity['median_speaker_similarity'])}</td></tr>"
+        f"<tr><td>Performance similarity</td><td>{_value(fidelity['median_performance_similarity'])}</td></tr>"
+        f"<tr><td>Pitch difference from the actor</td>"
+        f"<td>{_value(fidelity['median_pitch_delta_semitones'])} semitones</td></tr>"
+        f"<tr><td>Lines beyond the {PITCH_TOLERANCE_SEMITONES} semitone tolerance</td>"
+        f"<td>{fidelity['lines_beyond_pitch_tolerance']}</td></tr>"
+        f"<tr><td>Lines cloned from an acoustically matched take</td>"
+        f"<td>{fidelity['lines_cloned_from_a_matched_take']}</td></tr>"
+        f"<tr><td>Performance retakes kept</td><td>{fidelity['performance_retakes_kept']}</td></tr>"
+        f"<tr><td>Lines register-corrected</td><td>{fidelity['register_corrected_lines']}</td></tr>"
+        f"<tr><td>Lines voiced by the fallback engine</td><td>{fidelity['fallback_engine_lines']}</td></tr>"
+        "</tbody></table>"
         "<table><thead><tr><th>Line</th><th>Time</th><th>Dialogue</th><th>Reason</th></tr></thead>"
         f"<tbody>{rows}</tbody></table>", encoding="utf-8",
     )

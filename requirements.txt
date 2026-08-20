@@ -5,3 +5,6 @@ pydantic-settings==2.7.1
 pytest==8.3.4
 httpx==0.28.1
 demucs==4.0.1
+# Direct NVML bindings: the thermal watchdog polls continuously and
+# spawning nvidia-smi for each reading costs ~200 ms per poll.
+nvidia-ml-py==12.560.30

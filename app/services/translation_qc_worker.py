@@ -2,23 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import re
 from pathlib import Path
 
-
-def parse_json(text: str):
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\[[\s\S]*\]", text)
-        return json.loads(match.group(0)) if match else []
+from app.services.llm import decode_json, load_llama, response_tokens
 
 
-def ask(llm, prompt: str) -> str:
+def parse_json(text: str) -> list:
+    value = decode_json(text, list)
+    return value if isinstance(value, list) else []
+
+
+def ask(llm, prompt: str, max_tokens: int = 900) -> str:
     response = llm.create_chat_completion(
         messages=[{"role": "user", "content": prompt}], temperature=0.0,
-        top_p=.85, max_tokens=1500,
+        top_p=.85, max_tokens=max_tokens,
     )
     return str(response["choices"][0]["message"]["content"])
 
@@ -30,11 +27,19 @@ def main() -> None:
     args = parser.parse_args()
     spec = json.loads(args.manifest.read_text(encoding="utf-8"))
     cues = spec["cues"]
-    from llama_cpp import Llama
-    gpu_layers = int(os.getenv("DUB_LLAMA_GPU_LAYERS", "-1"))
-    llm = Llama(model_path=spec["model"], n_ctx=8192, n_batch=512, n_threads=10,
-                n_threads_batch=12, n_gpu_layers=gpu_layers, verbose=False)
+    import torch  # registers the bundled CUDA/cuBLAS DLL directory on Windows
+    llm = load_llama(spec["model"], n_ctx=8192)
     results = []
+    allowed_ids = {int(cue["id"]) for cue in cues}
+    if args.output.is_file():
+        try:
+            prior = json.loads(args.output.read_text(encoding="utf-8"))
+            results = [item for item in prior if isinstance(item, dict) and "id" in item
+                       and int(item["id"]) in allowed_ids]
+        except (OSError, ValueError, json.JSONDecodeError):
+            results = []
+    completed_ids = {int(item["id"]) for item in results}
+    cues = [cue for cue in cues if int(cue["id"]) not in completed_ids]
     # Keep every prompt well below the 8k context even when subtitle cards contain
     # long SDH/translator notes.  Fixed ten-line batches could silently truncate
     # precisely the difficult passages this independent check exists to catch.
@@ -48,37 +53,131 @@ def main() -> None:
         current.append(cue); characters += size
     if current:
         batches.append(current)
-    completed = 0
+    completed = len(completed_ids)
+    total = completed + len(cues)
     for batch in batches:
+        blind_lines = "\n".join(
+            f"ID {cue['id']} ({cue.get('source_language') or 'auto'}): {cue.get('source', '')}"
+            for cue in batch
+        )
+        blind_prompt = f"""/no_think
+Translate each SOURCE into literal, natural English without seeing or inferring any subtitle or dub.
+Preserve polarity, quantities, intent, names and who does what. If a source is only an incomplete
+fragment, translate the fragment and mark complete=false. Return only this JSON array:
+[{{"id":1,"translation":"...","complete":true}}]
+{blind_lines}"""
+        blind_values = parse_json(ask(llm, blind_prompt,
+            response_tokens(blind_lines, floor=700, ceiling=2048)))
+        blind_by_id = {int(item.get("id", -1)): item for item in blind_values
+                       if isinstance(item, dict)}
         lines = "\n".join(
             f"ID {cue['id']}\nSOURCE ({cue.get('source_language') or 'auto'}): {cue.get('source','')}\n"
+            f"SOURCE TRANSCRIPTION CONFIDENCE: {cue.get('transcription_confidence','unknown')}\n"
+            f"SECOND ASR OPINION: {json.dumps(cue.get('asr_second_opinion') or {}, ensure_ascii=False)}\n"
+            f"SUPPLIED SUBTITLE (independent but fallible): {cue.get('supplied_translation','')}\n"
             f"FAITHFUL ENGLISH: {cue.get('faithful_translation') or cue.get('literal_translation','')}\n"
             f"DUB ENGLISH: {cue.get('english','')}"
             for cue in batch
         )
-        prompt = f"""You are an independent bilingual film-translation quality checker.
+        prompt = f"""/no_think
+You are an independent bilingual film-translation quality checker.
 The translations were created by a different model. Judge SOURCE directly against DUB ENGLISH;
-use FAITHFUL ENGLISH only as secondary evidence. Detect changed facts, polarity, names, relationships,
-omissions, additions, mistranslated idioms and register changes. Do not reward fluency alone.
+use FAITHFUL ENGLISH only as secondary evidence. Before scoring, independently interpret SOURCE and
+every usable SECOND ASR OPINION. Matching the supplied subtitle is not proof of accuracy. Never report
+"no contradiction" without comparing its facts, polarity and intent to those source-language readings.
+The SECOND ASR OPINION may contain an english_translation generated literally without subtitle access;
+compare DUB ENGLISH directly against that independent English meaning as well as the original wording.
+SOURCE ASR can contain a plausible homophone error; use the supplied subtitle and surrounding ordered
+scene to arbitrate without blindly trusting either. When SOURCE and a second ASR with word_confidence
+above 0.85 agree, their meaning outweighs a contradictory subtitle. When the second ASR instead changes
+one plausible homophone with good confidence and makes a coherent full-dialogue subtitle semantically
+consistent, treat that convergence as strong independent evidence. Ignore a second ASR with poor word
+confidence or obvious fragments. Normal synonyms such as reimburse, compensate and pay back are
+semantically equivalent; do not invent a contradiction between them. If DUB English is
+semantically equivalent to that subtitle, reject it only for a clear, material contradiction supported
+by the surrounding source—not stylistic wording or minor specificity. A fragment that correctly
+continues an adjacent line is not an omission. Detect
+changed facts, polarity, names, relationships, omissions, additions, mistranslated idioms and register
+changes. Do not reward fluency alone.
 Return only a JSON array, one object per ID:
 {{"id":1,"adequacy":0.0,"names":0.0,"register":0.0,"passed":false,"reason":"concise specific reason"}}
 Pass only when adequacy >= 0.78, names >= 0.85, and no material omission/addition exists.
 
 {lines}"""
-        values = parse_json(ask(llm, prompt))
+        values = parse_json(ask(llm, prompt,
+            response_tokens(lines, floor=800, ceiling=2048, factor=0.8)))
         valid = {int(item.get("id", -1)): item for item in values if isinstance(item, dict)}
+        comparison_lines = []
+        comparison_meta: dict[int, dict] = {}
         for cue in batch:
-            item = valid.get(int(cue["id"]))
+            cue_id = int(cue["id"])
+            second = cue.get("asr_second_opinion") or {}
+            try:
+                second_reliable = (float(second.get("confidence") or 0.0) >= .55
+                                   and float(second.get("word_confidence") or 0.0) >= .85
+                                   and float(second.get("no_speech_probability") or 0.0) < .25
+                                   and bool(str(second.get("english_translation") or "").strip()))
+            except (TypeError, ValueError):
+                second_reliable = False
+            blind = blind_by_id.get(cue_id, {})
+            reference = (str(second.get("english_translation")) if second_reliable
+                         else str(blind.get("translation") or ""))
+            complete_value = blind.get("complete", False)
+            complete = (True if second_reliable else
+                        complete_value is True or str(complete_value).lower() == "true")
+            comparison_meta[cue_id] = {
+                "reference": reference, "complete": complete,
+                "basis": "reliable selective second ASR" if second_reliable else "blind Qwen source translation",
+                "blind": str(blind.get("translation") or ""),
+            }
+            comparison_lines.append(
+                f"ID {cue_id}\nREFERENCE ENGLISH ({comparison_meta[cue_id]['basis']}): {reference}\n"
+                f"REFERENCE COMPLETE: {complete}\nDUB ENGLISH: {cue.get('english', '')}\n"
+                f"SUPPLIED SUBTITLE (secondary, fallible): {cue.get('supplied_translation', '')}\n"
+                f"FAITHFUL DRAFT (secondary): {cue.get('faithful_translation') or cue.get('literal_translation', '')}"
+            )
+        comparison_prompt = f"""/no_think
+You are a strict English semantic equivalence checker. Compare DUB ENGLISH against REFERENCE ENGLISH,
+not against the subtitle. Equivalent paraphrases and synonyms pass. Changed polarity, more versus less,
+enough versus insufficient, changed actor/action, quantities, names, intent, additions or omissions fail.
+If REFERENCE COMPLETE is false, evidence_sufficient must be false unless ordered secondary evidence makes
+the missing meaning unambiguous; do not pretend an incomplete fragment verifies a full sentence.
+Return only one JSON array:
+[{{"id":1,"adequacy":0.0,"names":0.0,"register":0.0,"contradiction":true,
+"evidence_sufficient":true,"reason":"specific English meaning comparison"}}]
+{chr(10).join(comparison_lines)}"""
+        comparison_values = parse_json(ask(llm, comparison_prompt,
+            response_tokens(chr(10).join(comparison_lines), floor=800,
+                            ceiling=2048, factor=0.8)))
+        comparisons = {int(item.get("id", -1)): item for item in comparison_values
+                       if isinstance(item, dict)}
+        for cue in batch:
+            cue_id = int(cue["id"])
+            item = valid.get(cue_id)
             if not item:
                 item = {"id": cue["id"], "adequacy": 0.0, "names": 0.0, "register": 0.0,
                         "passed": False, "reason": "independent judge returned no result"}
+            semantic = comparisons.get(cue_id, {})
+            evidence = comparison_meta.get(cue_id, {})
+            item["independent_source_translation"] = evidence.get("blind", "")
+            item["semantic_reference"] = evidence.get("reference", "")
+            item["semantic_reference_basis"] = evidence.get("basis", "")
+            item["semantic_gate"] = semantic
+            item["adequacy"] = float(semantic.get("adequacy", 0.0))
+            item["names"] = float(semantic.get("names", 0.0))
+            item["register"] = float(semantic.get("register", 0.0))
+            item["reason"] = str(semantic.get("reason") or item.get("reason")
+                                 or "independent semantic gate returned no reason")
             item["available"] = True
             item["model"] = "Qwen3-8B Q4 independent bilingual judge"
-            item["passed"] = bool(item.get("passed")) and float(item.get("adequacy", 0)) >= .78
+            item["revision"] = str(spec.get("judge_revision") or "unknown")
+            item["passed"] = (bool(semantic.get("evidence_sufficient"))
+                              and not bool(semantic.get("contradiction"))
+                              and item["adequacy"] >= .78 and item["names"] >= .85)
             results.append(item)
         completed += len(batch)
         args.output.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(json.dumps({"progress": min(1.0, completed / max(1, len(cues))),
+        print(json.dumps({"progress": min(1.0, completed / max(1, total)),
                           "index": completed - 1}), flush=True)
 
 

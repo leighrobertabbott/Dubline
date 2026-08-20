@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import json
 import shutil
 import uuid
 import copy
@@ -14,7 +16,14 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from app.config import (load_local_environment, media_lookup_summary, remove_hf_token,
+                        remove_setting)
+
+load_local_environment()
+
 from app.services.pipeline import PipelineWorker, inspect_system
+from app.services.setup_manager import SetupManager
+from app.services.media_identity import MediaLibrary
 from app.services.subtitles import audio_streams, media_duration, probe_media, subtitle_streams
 from app.store import JobStore
 
@@ -25,6 +34,8 @@ DATA.mkdir(parents=True, exist_ok=True)
 WEB = BASE / "web"
 store = JobStore(DATA / "dubstudio.sqlite3")
 worker = PipelineWorker(store, DATA)
+setup = SetupManager(BASE, inspect_system)
+library = MediaLibrary(store, DATA)
 
 
 class FileSpec(BaseModel):
@@ -52,6 +63,18 @@ class MediaTrackSelection(BaseModel):
     subtitle_index: int | None = Field(default=None, ge=0)
 
 
+class SetupInstall(BaseModel):
+    enhanced_speakers: bool = True
+    selective_lip_sync: bool = False
+    media_lookup: bool = True
+
+
+class MediaIdentityChoice(BaseModel):
+    provider: Literal["tmdb", "tvmaze"]
+    media_type: Literal["movie", "tv"]
+    external_id: int = Field(gt=0)
+
+
 class CueUpdate(BaseModel):
     source: str | None = Field(default=None, min_length=1, max_length=1200)
     english: str | None = Field(default=None, min_length=1, max_length=1200)
@@ -72,13 +95,31 @@ def safe_name(name: str) -> str:
     return name[:255] or "source.bin"
 
 
+def public_project(project: dict | None) -> dict | None:
+    if not project:
+        return None
+    result = {key: project.get(key) for key in (
+        "id", "title", "year", "media_type", "provider", "external_id", "overview",
+        "site_url", "poster_ready", "created_at", "updated_at",
+    )}
+    result["poster_url"] = f"/api/projects/{project['id']}/poster" if project.get("poster_ready") else None
+    return result
+
+
 def public_job(job: dict) -> dict:
     result = copy.deepcopy(job)
     result.pop("input_path", None)
     result.pop("folder", None)
     for upload in result.get("uploads", []):
         upload.pop("path", None)
+    if result.get("project_id"):
+        result["project"] = public_project(store.get_project(result["project_id"]))
     return result
+
+
+def require_local_studio() -> None:
+    if not setup.snapshot()["ready"]:
+        raise HTTPException(409, "Finish local studio setup before starting a film")
 
 
 def invalidate_cue_artifacts(folder: Path, line: int) -> None:
@@ -113,13 +154,33 @@ def persist_job_cues(job: dict, cues: list[dict]) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    library.start()
     worker.start()
-    yield
-    worker.stop()
+    try:
+        yield
+    finally:
+        setup.shutdown()
+        library.stop()
+        worker.stop()
 
 
 app = FastAPI(title="Dubline", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=WEB), name="static")
+
+
+@app.middleware("http")
+async def local_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; img-src 'self' data:; script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; connect-src 'self'; object-src 'none'; "
+        "base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+    )
+    return response
 
 
 @app.get("/")
@@ -135,6 +196,111 @@ async def faq():
 @app.get("/api/system")
 async def system_status():
     return inspect_system()
+
+
+@app.get("/api/setup")
+async def setup_status():
+    return setup.snapshot()
+
+
+@app.post("/api/setup/token")
+async def configure_huggingface_token(request: Request):
+    raw = await request.body()
+    if len(raw) > 2048:
+        raise HTTPException(413, "The token entry was unexpectedly large")
+    try:
+        token = json.loads(raw).get("token")
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Enter a valid Hugging Face access token") from exc
+    if not isinstance(token, str):
+        raise HTTPException(400, "Enter a valid Hugging Face access token")
+    try:
+        return await asyncio.to_thread(setup.save_token, token)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.delete("/api/setup/token")
+async def forget_huggingface_token():
+    remove_hf_token()
+    return {"configured": False, "display": None}
+
+
+@app.post("/api/setup/install")
+async def install_setup(spec: SetupInstall):
+    try:
+        library.set_enabled(spec.media_lookup)
+        return setup.start(include_diarization=spec.enhanced_speakers,
+                           include_lip_sync=spec.selective_lip_sync)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@app.post("/api/setup/cancel")
+async def cancel_setup():
+    return setup.cancel()
+
+
+@app.get("/api/library/settings")
+async def library_settings():
+    return media_lookup_summary()
+
+
+@app.post("/api/library/token")
+async def configure_tmdb_token(request: Request):
+    raw = await request.body()
+    if len(raw) > 4096:
+        raise HTTPException(413, "The token entry was unexpectedly large")
+    try:
+        token = json.loads(raw).get("token")
+    except (AttributeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, "Enter a valid TMDB API Read Access Token") from exc
+    if not isinstance(token, str):
+        raise HTTPException(400, "Enter a valid TMDB API Read Access Token")
+    try:
+        return await asyncio.to_thread(library.save_tmdb_token, token)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.delete("/api/library/token")
+async def forget_tmdb_token():
+    remove_setting("TMDB_TOKEN")
+    return media_lookup_summary()
+
+
+@app.get("/api/library/search")
+async def search_media(q: str, media_type: Literal["movie", "tv"] | None = None,
+                       year: int | None = None):
+    try:
+        return await asyncio.to_thread(library.search, q, media_type, year)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/identify")
+async def identify_job(job_id: str, choice: MediaIdentityChoice):
+    store.get_or_404(job_id)
+    try:
+        await asyncio.to_thread(library.choose, job_id, choice.provider, choice.media_type, choice.external_id)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return public_job(store.get_or_404(job_id))
+
+
+@app.get("/api/projects/{project_id}/poster")
+async def project_poster(project_id: str):
+    if not store.get_project(project_id):
+        raise HTTPException(404, "Project not found")
+    path = library.poster_path(project_id)
+    if not path:
+        raise HTTPException(404, "This project does not have cached artwork")
+    return FileResponse(path, headers={"Cache-Control": "private, max-age=86400",
+                                       "X-Content-Type-Options": "nosniff"})
 
 
 @app.get("/api/jobs")
@@ -159,6 +325,7 @@ async def probe_local_media(spec: MediaProbeRequest):
 
 @app.post("/api/jobs")
 async def create_job(spec: JobCreate):
+    require_local_studio()
     sources = [item for item in spec.files if item.kind in {"video", "audio"}]
     if len(sources) != 1:
         raise HTTPException(400, "Select exactly one source video or audio programme")
@@ -195,7 +362,8 @@ async def create_job(spec: JobCreate):
         "cues": [],
         "logs": ["Job created"],
     })
-    return public_job(job)
+    library.attach(job_id, sources[0].name)
+    return public_job(store.get_or_404(job_id))
 
 
 @app.put("/api/jobs/{job_id}/files/{file_id}")
@@ -251,6 +419,7 @@ async def finalize_upload(job_id: str):
     if by_stem:
         store.update(job_id, uploads=job["uploads"])
     source = next(item for item in job["uploads"] if item["kind"] in {"video", "audio"})
+    library.attach(job_id, job.get("filename") or source["name"], Path(source["path"]))
     uploaded_probe = probe_media(Path(source["path"]))
     tracks = audio_streams(uploaded_probe)
     text_subtitles = [item for item in subtitle_streams(uploaded_probe) if item.get("text")]
@@ -288,6 +457,7 @@ async def select_job_media_tracks(job_id: str, selection: MediaTrackSelection):
 
 @app.post("/api/jobs/local")
 async def create_local_job(spec: LocalJobCreate):
+    require_local_studio()
     source = Path(spec.path).expanduser().resolve()
     if not source.is_file():
         raise HTTPException(404, "That local video file was not found")
@@ -308,8 +478,9 @@ async def create_local_job(spec: LocalJobCreate):
         "uploads": [], "sidecars": sidecars, "options": options,
         "cues": [], "logs": ["Local source added without copying"],
     })
+    library.attach(job_id, source.name, source)
     worker.submit(job_id)
-    return public_job(job)
+    return public_job(store.get_or_404(job_id))
 
 
 @app.post("/api/jobs/{job_id}/control/{action}")
@@ -321,6 +492,7 @@ async def control_job(job_id: str, action: Literal["pause", "resume", "cancel"])
             if job["status"] not in {"paused", "error"}:
                 raise HTTPException(409, "Only paused or failed jobs can be resumed")
             job = store.update(job_id, status="queued", stage="Waiting to resume", error=None,
+                               auto_resume_pending=False,
                                analysis_approved=True if job.get("stage") == "Translation ready for approval" else job.get("analysis_approved"))
             should_submit = True
         elif action == "pause":
@@ -336,7 +508,8 @@ async def control_job(job_id: str, action: Literal["pause", "resume", "cancel"])
             if job["status"] == "processing":
                 job = store.update(job_id, control="cancel", stage="Cancelling")
             else:
-                job = store.update(job_id, status="cancelled", stage="Cancelled", control=None)
+                job = store.update(job_id, status="cancelled", stage="Cancelled", control=None,
+                                   auto_resume_pending=False)
     if should_submit:
         worker.submit(job_id)
     return public_job(store.get_or_404(job_id))

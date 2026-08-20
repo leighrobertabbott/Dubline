@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -28,7 +30,7 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
     model.eval().to(device)
     valid_indices: list[int] = []
     embeddings: list[np.ndarray] = []
-    energies: dict[int, float] = {}
+    qualities: dict[int, dict] = {}
 
     with sf.SoundFile(dialogue_audio) as reader, torch.inference_mode():
         source_rate = reader.samplerate
@@ -39,8 +41,8 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
                 continue
             reader.seek(start)
             samples = reader.read(end - start, dtype="float32", always_2d=True).mean(axis=1)
-            energies[index] = float(np.sqrt(np.mean(samples * samples) + 1e-12))
-            if len(samples) < source_rate * 0.65 or energies[index] < 2e-4:
+            qualities[index] = reference_metrics(samples, source_rate, cue)
+            if len(samples) < source_rate * 0.65 or qualities[index]["rms"] < 2e-4:
                 continue
             waveform = torch.from_numpy(samples)[None]
             if source_rate != 16_000:
@@ -60,7 +62,9 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
     labels = cluster_embeddings(np.stack(embeddings)) if embeddings and not preserve_diarization else np.zeros(0, dtype=int)
     if preserve_diarization:
         for index, cue in enumerate(cues):
-            cue["reference_quality"] = round(energies.get(index, 0.0), 6)
+            metrics = qualities.get(index, {})
+            cue["reference_quality"] = float(metrics.get("score", 0.0))
+            cue["reference_metrics"] = metrics
         output_dir.mkdir(parents=True, exist_ok=True)
         references = build_reference_bank(dialogue_audio, cues, output_dir)
         del model
@@ -80,7 +84,9 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
             cues[index]["speaker_id"] = 0
             cues[index]["speaker"] = "Uncertain voice"
             cues[index]["speaker_confidence"] = 0.0
-            cues[index]["reference_quality"] = round(energies.get(index, 0.0), 6)
+            metrics = qualities.get(index, {})
+            cues[index]["reference_quality"] = float(metrics.get("score", 0.0))
+            cues[index]["reference_metrics"] = metrics
             continue
         if cluster not in ordered:
             ordered[cluster] = len(ordered) + 1
@@ -89,7 +95,9 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
         cues[index]["speaker_id"] = speaker_id
         cues[index]["speaker"] = f"Voice {speaker_id}"
         cues[index]["speaker_confidence"] = 0.9 if index in valid_assignment_indices else 0.0
-        cues[index]["reference_quality"] = round(energies.get(index, 0.0), 6)
+        metrics = qualities.get(index, {})
+        cues[index]["reference_quality"] = float(metrics.get("score", 0.0))
+        cues[index]["reference_metrics"] = metrics
 
     for index, cue in enumerate(cues):
         overlaps = any(
@@ -126,12 +134,63 @@ def cluster_embeddings(values: np.ndarray) -> np.ndarray:
     return labels
 
 
+def reference_metrics(samples: np.ndarray, rate: int, cue: dict | None = None) -> dict:
+    """Score clone references for speech cleanliness, not mere loudness."""
+    cue = cue or {}
+    mono = np.asarray(samples, dtype=np.float32)
+    rms = float(np.sqrt(np.mean(mono * mono) + 1e-12)) if len(mono) else 0.0
+    frame = max(1, round(rate * .02))
+    usable = len(mono) // frame * frame
+    levels = (np.sqrt(np.mean(mono[:usable].reshape(-1, frame) ** 2, axis=1) + 1e-12)
+              if usable else np.zeros(0, dtype=np.float32))
+    noise = float(np.percentile(levels, 20)) if len(levels) else 1e-6
+    speech = float(np.percentile(levels, 90)) if len(levels) else 0.0
+    snr_db = float(np.clip(20 * np.log10(max(speech, 1e-7) / max(noise, 1e-7)), 0, 60))
+    threshold = max(10 ** (-48 / 20), noise * 2.5, speech * .10)
+    active_ratio = float(np.mean(levels >= threshold)) if len(levels) else 0.0
+    clipping = float(np.mean(np.abs(mono) >= .985)) if len(mono) else 1.0
+    speech_band_ratio = 0.0
+    if len(mono) >= 64:
+        spectrum = np.abs(np.fft.rfft(mono * np.hanning(len(mono)))) ** 2
+        frequencies = np.fft.rfftfreq(len(mono), 1 / rate)
+        total = float(spectrum[(frequencies >= 40) & (frequencies <= min(rate / 2, 11_000))].sum()) + 1e-12
+        speech_band_ratio = float(spectrum[(frequencies >= 90) & (frequencies <= 4_800)].sum()) / total
+    snr_score = float(np.clip((snr_db - 7) / 23, 0, 1))
+    activity_score = float(np.clip(active_ratio / .48, 0, 1) * np.clip((1.02 - active_ratio) / .18, 0, 1))
+    band_score = float(np.clip((speech_band_ratio - .48) / .42, 0, 1))
+    confidence = float(cue.get("speaker_confidence", 0.0))
+    tail = float(cue.get("source_performance", {}).get("tail_ratio", 0.0))
+    score = (.32 * snr_score + .24 * activity_score + .22 * band_score + .22 * confidence)
+    score *= max(.25, 1 - min(.65, tail * .35))
+    score *= max(0.0, 1 - min(1.0, clipping * 35))
+    if cue.get("overlapping_speech"):
+        score *= .2
+    return {"score": round(float(np.clip(score, 0, 1)), 4), "rms": round(rms, 7),
+            "snr_db": round(snr_db, 2), "active_ratio": round(active_ratio, 3),
+            "speech_band_ratio": round(speech_band_ratio, 3), "clipping_ratio": round(clipping, 6)}
+
+
+def _vad_trim(samples: np.ndarray, rate: int) -> np.ndarray:
+    frame = max(1, round(rate * .02)); usable = len(samples) // frame * frame
+    if not usable:
+        return samples
+    levels = np.sqrt(np.mean(samples[:usable].reshape(-1, frame) ** 2, axis=1) + 1e-12)
+    threshold = max(10 ** (-48 / 20), float(np.percentile(levels, 20)) * 2.5,
+                    float(np.percentile(levels, 90)) * .10)
+    active = np.flatnonzero(levels >= threshold)
+    if not len(active):
+        return samples
+    start = max(0, int(active[0] * frame - rate * .06))
+    end = min(len(samples), int((active[-1] + 1) * frame + rate * .08))
+    return samples[start:end]
+
+
 def build_reference_bank(dialogue_audio: Path, cues: list[dict], output_dir: Path) -> dict[int, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     groups: dict[int, list[tuple[float, int, dict]]] = defaultdict(list)
     for index, cue in enumerate(cues):
         duration = float(cue["end"]) - float(cue["start"])
-        energy = float(cue.get("reference_quality", 0.0))
+        quality = float(cue.get("reference_quality", 0.0))
         # A long but wrongly assigned line is far more damaging than a short
         # reference bank.  Only clean, confident full-film assignments are
         # allowed to teach a recurring character voice.  Tentative lines still
@@ -140,29 +199,42 @@ def build_reference_bank(dialogue_audio: Path, cues: list[dict], output_dir: Pat
         if (int(cue.get("speaker_id", 0)) <= 0
                 or float(cue.get("speaker_confidence", 0.0)) < 0.62
                 or bool(cue.get("overlapping_speech"))
-                or duration < 0.65):
+                or duration < 0.65 or quality < .30):
             continue
-        score = min(duration, 5.0) * np.log10(1 + energy * 10_000)
+        duration_score = min(duration, 6.0) / 6.0
+        score = quality * .82 + duration_score * .18
         groups[int(cue["speaker_id"])].append((score, index, cue))
 
     references: dict[int, Path] = {}
+    variants: dict[int, list[dict]] = {}
     with sf.SoundFile(dialogue_audio) as reader:
         rate = reader.samplerate
         for speaker_id, candidates in groups.items():
-            parts = []
+            parts = []; used_cues = []
             seconds = 0.0
-            for _, _, cue in sorted(candidates, reverse=True):
+            ordered = sorted(candidates, reverse=True)
+            # A single pristine utterance is more coherent than a montage.  A
+            # VAD-cleaned collection is only used when no 3–8 second take exists.
+            pristine = [item for item in ordered
+                        if 3.0 <= float(item[2]["end"]) - float(item[2]["start"]) <= 8.0
+                        and float(item[2].get("reference_quality", 0.0)) >= .48]
+            selected = pristine[:1] if pristine else ordered
+            variants[speaker_id] = _acoustic_variants(reader, rate, pristine, selected,
+                                                      output_dir, speaker_id, cues)
+            for _, cue_index, cue in selected:
                 start = max(0, round((float(cue["start"]) - 0.1) * rate))
                 end = min(len(reader), round((float(cue["end"]) + 0.1) * rate))
                 if end <= start:
                     continue
                 reader.seek(start)
                 samples = reader.read(end - start, dtype="float32", always_2d=True).mean(axis=1)
+                samples = _vad_trim(samples, rate)
                 if len(samples) < rate * 0.4:
                     continue
                 parts.append(samples)
+                used_cues.append(cue_index)
                 seconds += len(samples) / rate
-                if seconds >= 8.0:
+                if pristine or seconds >= 8.0:
                     break
                 parts.append(np.zeros(round(rate * 0.08), dtype=np.float32))
             if not parts:
@@ -174,8 +246,138 @@ def build_reference_bank(dialogue_audio: Path, cues: list[dict], output_dir: Pat
             montage = np.clip(montage * gain, -0.95, 0.95)
             path = output_dir / f"voice-{speaker_id:03d}.wav"
             sf.write(path, montage, rate, subtype="PCM_16")
+            transcript = ". ".join(str(cues[index].get("source", "")).strip(" .")
+                                     for index in used_cues if str(cues[index].get("source", "")).strip())
+            metadata = {"version": 2, "speaker_id": speaker_id, "reference_text": transcript,
+                        "cue_indices": used_cues, "seconds": round(len(montage) / rate, 3),
+                        "quality": round(max(float(cues[index].get("reference_quality", 0.0))
+                                             for index in used_cues), 4)}
+            path.with_suffix(".json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2),
+                                                  encoding="utf-8")
             references[speaker_id] = path
+    _write_variant_index(output_dir, variants)
     return references
+
+
+def _clip_profile(samples: np.ndarray, rate: int) -> dict:
+    """Describe a reference clip the same way cues describe source performance."""
+    mono = np.asarray(samples, dtype=np.float32)
+    rms = float(np.sqrt(np.mean(mono * mono) + 1e-12)) if len(mono) else 0.0
+    centroid = 0.0
+    if len(mono) >= 64:
+        spectrum = np.abs(np.fft.rfft(mono * np.hanning(len(mono))))
+        frequencies = np.fft.rfftfreq(len(mono), 1 / rate)
+        centroid = float(np.sum(frequencies * spectrum) / max(float(np.sum(spectrum)), 1e-9))
+    pitch = 0.0
+    try:
+        import librosa
+
+        track = librosa.yin(mono, fmin=65, fmax=500, sr=rate,
+                            frame_length=min(2048, max(512, 2 ** int(np.log2(max(len(mono), 512))))))
+        valid = track[np.isfinite(track) & (track >= 65) & (track <= 500)]
+        pitch = float(np.median(valid)) if len(valid) else 0.0
+    except (ImportError, ValueError, FloatingPointError):
+        pass
+    return {"pitch_hz": round(pitch, 1), "rms": round(rms, 6),
+            "spectral_centroid_hz": round(centroid, 1)}
+
+
+def _acoustic_variants(reader, rate: int, pristine: list, selected: list, output_dir: Path,
+                       speaker_id: int, cues: list[dict]) -> list[dict]:
+    """Keep a few acoustically distinct takes per character, not just the best one.
+
+    An actor does not sound like one five-second clip for a whole feature: they
+    shout, whisper, and play scenes at different distances from the mic.  Cloning
+    every line from a single take caps timbre fidelity no matter how good that
+    take is, so the bank keeps spread and each line picks its nearest match.
+    """
+    keep = max(1, min(6, int(os.getenv("DUB_REFERENCE_VARIANTS", "4"))))
+    pool = (pristine or selected)[:24]
+    chosen: list[dict] = []
+    for _, cue_index, cue in pool:
+        if len(chosen) >= keep:
+            break
+        start = max(0, round((float(cue["start"]) - 0.1) * rate))
+        end = min(len(reader), round((float(cue["end"]) + 0.1) * rate))
+        if end <= start:
+            continue
+        reader.seek(start)
+        samples = _vad_trim(reader.read(end - start, dtype="float32", always_2d=True).mean(axis=1), rate)
+        if len(samples) < rate * 0.8:
+            continue
+        profile = _clip_profile(samples, rate)
+        if not profile["pitch_hz"]:
+            continue
+        # Spread, not repetition: a near-duplicate of a kept take teaches nothing
+        # new about how this character sounds.
+        if any(abs(profile["pitch_hz"] - item["profile"]["pitch_hz"]) < 6
+               and abs(profile["spectral_centroid_hz"] - item["profile"]["spectral_centroid_hz"]) < 220
+               for item in chosen):
+            continue
+        rms = float(np.sqrt(np.mean(samples * samples) + 1e-12))
+        normalized = np.clip(samples * min(12.0, 0.075 / max(rms, 1e-5)), -0.95, 0.95)
+        path = output_dir / f"take-{speaker_id:03d}-{len(chosen):02d}.wav"
+        sf.write(path, normalized, rate, subtype="PCM_16")
+        transcript = str(cues[cue_index].get("source", "")).strip()
+        path.with_suffix(".json").write_text(json.dumps(
+            {"speaker_id": speaker_id, "reference_text": transcript, "cue_index": cue_index,
+             "profile": profile}, ensure_ascii=False, indent=2), encoding="utf-8")
+        chosen.append({"path": str(path), "cue_index": cue_index, "profile": profile,
+                       "reference_text": transcript})
+    return chosen
+
+
+def _write_variant_index(output_dir: Path, variants: dict[int, list[dict]]) -> None:
+    payload = {str(speaker_id): items for speaker_id, items in variants.items() if items}
+    (output_dir / "reference-variants.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_reference_variants(output_dir: Path) -> dict[int, list[dict]]:
+    path = output_dir / "reference-variants.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {int(key): value for key, value in payload.items() if isinstance(value, list)}
+
+
+def select_reference(cue: dict, variants: list[dict], default: Path) -> tuple[Path, str]:
+    """Pick the take of this character that sounds most like this line.
+
+    Distance is measured in the units the ear cares about: pitch in semitones,
+    brightness in octaves, level in decibels.  Falls back to the canonical bank
+    clip whenever the line was never measured or nothing is close.
+    """
+    performance = cue.get("source_performance") or {}
+    pitch = float(performance.get("pitch_hz") or 0.0)
+    if not variants or pitch <= 0:
+        return default, "character bank"
+    centroid = float(performance.get("spectral_centroid_hz") or 0.0)
+    level = float(performance.get("rms") or 0.0)
+    best, best_distance = None, float("inf")
+    for item in variants:
+        profile = item.get("profile") or {}
+        candidate_pitch = float(profile.get("pitch_hz") or 0.0)
+        if candidate_pitch <= 0:
+            continue
+        distance = abs(12 * math.log2(pitch / candidate_pitch))
+        candidate_centroid = float(profile.get("spectral_centroid_hz") or 0.0)
+        if centroid > 0 and candidate_centroid > 0:
+            distance += abs(math.log2(centroid / candidate_centroid)) * 2.0
+        candidate_level = float(profile.get("rms") or 0.0)
+        if level > 0 and candidate_level > 0:
+            distance += abs(20 * math.log10(level / candidate_level)) * .12
+        if distance < best_distance:
+            best, best_distance = item, distance
+    if best is None:
+        return default, "character bank"
+    path = Path(str(best["path"]))
+    if not path.is_file():
+        return default, "character bank"
+    return path, f"nearest take (±{best_distance:.1f})"
 
 
 def score_speaker_similarity(cues: list[dict], generated_dir: Path,

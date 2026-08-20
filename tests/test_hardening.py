@@ -13,6 +13,8 @@ from app.services.diarization import diarization_runtime_settings
 from app.services.pipeline import PipelineWorker, SAMPLE_RATE, remux, render_timeline
 from app.services.qwen_asr_worker import grouped_cues
 from app.services import gpu_safety
+from app.services import pipeline as pipeline_service
+from app.services.job_lock import acquire_job_lock, release_job_lock
 from app.services.subtitles import choose_audio, choose_embedded, parse_srt
 from app.services.subprocess_control import controlled_lines
 from app.services.visual_speakers_worker import consolidate_identities, mouth_patch
@@ -248,19 +250,31 @@ def test_completed_legacy_face_scan_migrates_without_rescanning(tmp_path: Path):
     assert migrated["identities"][0]["observations"] == 11
 
 
-def test_full_film_diarization_defaults_to_bounded_cpu_execution():
-    assert diarization_runtime_settings({}) == ("cpu", 4, 8)
+def test_full_film_diarization_defaults_to_bounded_cuda_execution():
+    assert diarization_runtime_settings({}) == ("cuda", 2, 8)
     assert diarization_runtime_settings({"DUB_DIARIZATION_DEVICE": "cuda",
                                          "DUB_DIARIZATION_BATCH_SIZE": "99",
                                          "DUB_DIARIZATION_CPU_THREADS": "99"}) == ("cuda", 8, 12)
     assert diarization_runtime_settings({"DUB_DIARIZATION_DEVICE": "invalid",
-                                         "DUB_DIARIZATION_BATCH_SIZE": "bad"}) == ("cpu", 4, 8)
+                                         "DUB_DIARIZATION_BATCH_SIZE": "bad"}) == ("cuda", 4, 8)
 
 
 def test_gpu_health_csv_is_fail_closed():
     assert gpu_safety.parse_nvidia_status("7000, 8188, 66, 4, 22.5")["free_mb"] == 7000
     with pytest.raises(RuntimeError):
         gpu_safety.parse_nvidia_status("GPU is lost")
+
+
+def test_job_execution_lock_rejects_a_duplicate_worker(tmp_path: Path):
+    first = acquire_job_lock(tmp_path)
+    assert first is not None
+    try:
+        assert acquire_job_lock(tmp_path) is None
+    finally:
+        release_job_lock(first)
+    second = acquire_job_lock(tmp_path)
+    assert second is not None
+    release_job_lock(second)
 
 
 def test_gpu_stage_leaves_crash_evident_state_and_commits_safe_handoff(tmp_path: Path, monkeypatch):
@@ -284,6 +298,61 @@ def test_gpu_stage_leaves_crash_evident_state_and_commits_safe_handoff(tmp_path:
             raise RuntimeError("worker failed")
     assert json.loads(state_path.read_text(encoding="utf-8"))["status"] == "interrupted"
 
+    canaries = []
+    monkeypatch.setattr(gpu_safety, "_canary", lambda path, checkpoint: (
+        canaries.append(True), gpu_safety._write_state(
+            path, {"status": "idle", "last_canary_at": 2, "boot_token": gpu_safety._boot_token()})
+    )[-1])
+    with gpu_safety.gpu_stage(tmp_path, "recovered stage", lambda: None):
+        pass
+    assert canaries, "an interrupted CUDA stage must force an isolated canary before reuse"
+
+
+def test_active_gpu_watchdog_stops_a_hot_worker_at_checkpoint(tmp_path: Path, monkeypatch):
+    import json
+    import time
+    state_path = tmp_path / "gpu-safety.json"
+    cool = {"free_mb": 8000, "total_mb": 8188, "temperature_c": 60,
+            "utilization": 0, "power_w": 12.0}
+    hot = {**cool, "temperature_c": 91, "utilization": 99, "power_w": 95.0}
+    monkeypatch.setattr(gpu_safety, "_state_path", lambda _: state_path)
+    monkeypatch.setattr(gpu_safety, "_watchdog_interval", lambda: .01)
+    monkeypatch.setattr(gpu_safety, "query_nvidia", lambda: (
+        hot if __import__("threading").current_thread().name == "cuda-thermal-watchdog" else cool
+    ))
+    monkeypatch.setattr(gpu_safety, "_cooldown", lambda checkpoint, seconds=8.0: cool)
+    monkeypatch.setattr(gpu_safety, "_canary", lambda path, checkpoint: gpu_safety._write_state(
+        path, {"status": "idle", "last_canary_at": 1, "boot_token": gpu_safety._boot_token()}))
+
+    with pytest.raises(gpu_safety.GPUStageUnsafe, match="91°C"):
+        with gpu_safety.gpu_stage(tmp_path, "hot test stage", lambda: None):
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                gpu_safety.gpu_checkpoint()
+                time.sleep(.01)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    assert state["status"] == "interrupted"
+    assert "91°C" in state["error"]
+
+
+def test_thermal_pause_auto_resumes_only_after_stable_cooldown(tmp_path: Path, monkeypatch):
+    store = JobStore(tmp_path / "jobs.sqlite3")
+    store.create({"id": "thermal", "filename": "film.mkv", "status": "paused",
+                  "stage": "Cooling", "progress": 42, "auto_resume_pending": True,
+                  "cues": []})
+    worker = PipelineWorker(store, tmp_path)
+    cool = {"free_mb": 8000, "total_mb": 8188, "temperature_c": 68,
+            "utilization": 0, "power_w": 12.0}
+    monkeypatch.setattr(pipeline_service, "query_nvidia", lambda: cool)
+    monkeypatch.setattr(worker.stopping, "wait", lambda _: False)
+
+    worker._resume_after_cooldown("thermal")
+
+    resumed = store.get_summary("thermal")
+    assert resumed["status"] == "queued"
+    assert resumed["auto_resume_pending"] is False
+    assert worker.jobs.get_nowait() == "thermal"
+
 
 def test_remux_preserves_source_stream_identity_and_disposition(tmp_path: Path):
     source = tmp_path / "source.mkv"; mix = tmp_path / "mix.flac"; output = tmp_path / "output.mkv"
@@ -302,3 +371,42 @@ def test_remux_preserves_source_stream_identity_and_disposition(tmp_path: Path):
     assert evidence["streams_preserved_exactly"]
     assert evidence["metadata_preserved"]
     assert evidence["english_lossless_track"]
+
+def test_no_service_module_references_an_unimported_name():
+    """Guard against a name that only fails once a worker is deep into a job.
+
+    Every heavy stage runs in its own subprocess, so a missing import is not a
+    syntax error and not an import error -- it is a NameError raised minutes or
+    hours in, after the GPU work that preceded it has already been spent.
+    """
+    import ast
+    import builtins
+
+    services = sorted(Path("app/services").glob("*.py"))
+    assert services, "no service modules were found to check"
+    problems = {}
+    for module in services:
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        bound = set(dir(builtins))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    bound.add((alias.asname or alias.name).split(".")[0])
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    bound.add(alias.asname or alias.name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                bound.add(node.name)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                bound.add(node.id)
+            elif isinstance(node, ast.arg):
+                bound.add(node.arg)
+            elif isinstance(node, ast.ExceptHandler) and node.name:
+                bound.add(node.name)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                bound.update(node.names)
+        used = {node.id for node in ast.walk(tree)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)}
+        if used - bound:
+            problems[module.name] = sorted(used - bound)
+    assert not problems, f"unimported names: {problems}"

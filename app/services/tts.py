@@ -48,6 +48,11 @@ class ContextEmotionAnalyzer:
                 pass
             self.analyzer = None
             try:
+                # Serialize CUDA launches on thermal-constrained laptop GPUs.
+                # Work remains CUDA-accelerated, but short vocoder/diffusion
+                # bursts cannot stack into the 100+ W spikes seen in testing.
+                os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+                os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
                 import torch
                 torch.cuda.empty_cache()
             except Exception:
@@ -94,17 +99,15 @@ class IndexTTSEngine:
     def synthesize(self, text: str, reference_audio: Path, output: Path, target_seconds: float,
                    emotion_vector: list[float] | None = None, emotion_strength: float = 0.6,
                    emotion_audio: Path | None = None, language: str = "EN",
-                   use_random: bool = False) -> None:
+                   use_random: bool = False, duration_factor: float = 1.0) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
         if self.mode == "preview":
             self._preview_voice(text, output)
             return
         model = self._load()
-        estimated = max(0.7, len(text) / 14.0)
-        duration_factor = min(1.8, max(0.55, target_seconds / estimated))
         model.infer(
             spk_audio_prompt=str(reference_audio), text=text, lang=language, output_path=str(output),
-            duration_factor=duration_factor, emo_vector=emotion_vector,
+            duration_factor=min(2.0, max(0.5, float(duration_factor))), emo_vector=emotion_vector,
             emo_audio_prompt=str(emotion_audio) if emotion_audio and emotion_vector is None else None,
             emo_alpha=emotion_strength,
             use_random=use_random, verbose=False,

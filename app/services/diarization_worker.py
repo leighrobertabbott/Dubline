@@ -46,8 +46,8 @@ def main() -> None:
     parser.add_argument("--audio", type=Path, required=True)
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--cpu-threads", type=int, default=8)
     args = parser.parse_args()
     from pyannote.audio import Pipeline
@@ -56,9 +56,9 @@ def main() -> None:
         torch.set_num_threads(max(1, min(12, args.cpu_threads)))
         torch.set_num_interop_threads(1)
     pipeline = Pipeline.from_pretrained(str(args.model))
-    # Community-1 ships with batch sizes of 32.  Sustaining that load over a
-    # feature film triggered VIDEO_DXGKRNL_FATAL_ERROR on this 8 GB laptop GPU.
-    # CPU is the production-safe default; CUDA remains an explicit opt-in.
+    # Community-1 ships with batch sizes of 32.  This worker only receives a
+    # bounded film chunk and is destroyed after it, so model memory and CUDA
+    # context cannot accumulate across a feature film.
     pipeline.segmentation_batch_size = max(1, args.batch_size)
     pipeline.embedding_batch_size = max(1, args.batch_size)
     pipeline.to(torch.device(args.device))
@@ -69,6 +69,14 @@ def main() -> None:
                        "sample_rate": sample_rate}, hook=JsonProgressHook())
     if hasattr(result, "serialize"):
         payload = result.serialize()
+        embeddings = getattr(result, "speaker_embeddings", None)
+        annotation = getattr(result, "speaker_diarization", None)
+        if embeddings is not None and annotation is not None:
+            labels = list(annotation.labels())
+            payload["speaker_embeddings"] = {
+                str(label): [round(float(value), 8) for value in embeddings[index].tolist()]
+                for index, label in enumerate(labels) if index < len(embeddings)
+            }
     else:
         payload = {
             "diarization": [{"start": round(turn.start, 3), "end": round(turn.end, 3), "speaker": speaker}

@@ -12,18 +12,26 @@ import sys
 import threading
 import time
 import statistics
+import hashlib
 from pathlib import Path
 from typing import Callable
 
 from app.services.cinematic import recover_roformer, recover_vocals, separate_cinematic_audio
 from app.services.analysis_cache import media_fingerprint, restore_json_artifact, store_json_artifact
-from app.services.gpu_safety import gpu_safety_summary, gpu_stage
+from app.services.gpu_safety import (GPUStageUnsafe, gpu_checkpoint, gpu_safety_summary,
+                                     gpu_stage, query_nvidia)
+from app.services.job_lock import acquire_job_lock, job_is_running, release_job_lock
 from app.services.asr import transcribe_aligned
 from app.services.adapter import adapt_dialogue
-from app.services.dialogue import analyze_performance, build_adaptive_dialogue, measure_dialogue_leakage
+from app.services.dialogue import (analyze_performance, build_adaptive_dialogue,
+                                   measure_dialogue_leakage, suppress_dialogue_leakage)
 from app.services.diarization import assign_diarized_speakers, diarize
-from app.services.qc import backtranscribe_lines, evaluate_media_qc, inspect_cues, media_qc, write_report
-from app.services.speakers import analyze_speakers, score_speaker_similarity
+from app.services.qc import (PERFORMANCE_RETAKE_THRESHOLD, PITCH_TOLERANCE_SEMITONES,
+                             backtranscribe_lines, evaluate_media_qc, inspect_cues,
+                             measure_performance_similarity, media_qc, register_correction,
+                             write_report)
+from app.services.speakers import (analyze_speakers, load_reference_variants,
+                                   score_speaker_similarity, select_reference)
 from app.services.visual_speakers import build_face_registry, register_visual_speakers
 from app.services.lipsync import apply_selective_lipsync
 from app.services.subtitles import (
@@ -32,12 +40,16 @@ from app.services.subtitles import (
     write_srt,
 )
 from app.services.tts import analyze_context_emotions, synthesize_qwen_fallback, synthesize_voice_lines
-from app.services.translation_qc import validate_translations
+from app.services.translation_qc import TRANSLATION_QC_REVISION, validate_translations
 from app.services.subprocess_control import controlled_lines, terminate_process
 from app.store import JobStore
 
 
 SAMPLE_RATE = 24_000
+# Conditioning strength when the emotion prompt is the actor's own delivery of
+# this exact line, and the stronger value a retake escalates to.
+SOURCE_EMOTION_STRENGTH = 0.85
+RETAKE_EMOTION_STRENGTH = 1.0
 _whisper_models: dict[str, object] = {}
 _whisper_lock = threading.Lock()
 _run_context = threading.local()
@@ -194,8 +206,13 @@ class PipelineWorker:
         self.stopping.clear()
         self.thread = threading.Thread(target=self._work, name="dubline-gpu-worker", daemon=True)
         self.thread.start()
-        for job_id in self.store.recover_interrupted():
+        for job_id in self.store.recover_interrupted(
+            lambda job: job_is_running(Path(job["folder"])) if job.get("folder") else False
+        ):
             self.submit(job_id)
+        for job in self.store.list_summaries():
+            if job.get("status") == "paused" and job.get("auto_resume_pending"):
+                self.submit(str(job["id"]))
 
     def stop(self) -> None:
         self.stopping.set()
@@ -216,19 +233,70 @@ class PipelineWorker:
             if job_id is None:
                 break
             try:
-                run_pipeline(job_id, self.store)
+                current = self.store.get_summary(job_id) or {}
+                if current.get("status") == "paused" and current.get("auto_resume_pending"):
+                    self._resume_after_cooldown(job_id)
+                else:
+                    run_pipeline(job_id, self.store)
+                    current = self.store.get_summary(job_id) or {}
+                    if current.get("status") == "paused" and current.get("auto_resume_pending"):
+                        self._resume_after_cooldown(job_id)
             finally:
                 self.jobs.task_done()
+
+    def _resume_after_cooldown(self, job_id: str) -> None:
+        """Resume only watchdog-created pauses after stable thermal recovery."""
+        stable_samples = 0
+        deadline = time.monotonic() + float(os.getenv("DUB_GPU_AUTO_RESUME_TIMEOUT_SECONDS", "600"))
+        last_label = ""
+        while not self.stopping.is_set() and time.monotonic() < deadline:
+            current = self.store.get_summary(job_id) or {}
+            if current.get("status") != "paused" or not current.get("auto_resume_pending"):
+                return
+            try:
+                health = query_nvidia()
+                safe = (health["temperature_c"] <= 70 and health["utilization"] <= 10
+                        and health["free_mb"] >= health["total_mb"] - 900)
+                stable_samples = stable_samples + 1 if safe else 0
+                label = (f"Cooling GPU safely · {health['temperature_c']}°C · "
+                         f"auto-resume after {max(0, 3 - stable_samples)} stable check(s)")
+            except Exception as exc:
+                stable_samples = 0
+                label = f"Waiting for NVIDIA health monitoring · {exc}"
+            if label != last_label:
+                self.store.update(job_id, stage=label)
+                last_label = label
+            if stable_samples >= 3:
+                with self.store.lock:
+                    current = self.store.get_summary(job_id) or {}
+                    if current.get("status") != "paused" or not current.get("auto_resume_pending"):
+                        return
+                    self.store.update(job_id, status="queued", stage="GPU cooled · resuming automatically",
+                                      error=None, control=None, auto_resume_pending=False)
+                self.submit(job_id)
+                return
+            self.stopping.wait(2.0)
+        current = self.store.get_summary(job_id) or {}
+        if current.get("status") == "paused" and current.get("auto_resume_pending"):
+            self.store.update(job_id, stage="GPU safety pause · automatic cooldown timed out",
+                              auto_resume_pending=False)
 
 
 def run_pipeline(job_id: str, store: JobStore) -> None:
     run_started_at = time.time()
+    initial = store.get(job_id)
+    if not initial or initial.get("status") != "queued":
+        return
+    execution_lock = acquire_job_lock(Path(initial["folder"]))
+    if execution_lock is None:
+        return
     # Claim and transition under the same store lock used by pause/cancel.  A
     # control request can therefore happen entirely before or after this claim,
     # never in a gap where the worker overwrites it.
     with store.lock:
         job = store.get(job_id)
         if not job or job.get("status") != "queued":
+            release_job_lock(execution_lock)
             return
         job = store.update(
             job_id, status="processing", control=None, error=None,
@@ -246,12 +314,14 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         return accumulated_active + max(0.0, time.time() - run_started_at)
 
     def update(progress: float, stage: str, **extra) -> dict:
-        return store.update(job_id, status="processing", progress=round(progress, 1), stage=stage, **extra)
+        return store.update(job_id, status="processing", progress=round(progress, 1),
+                            stage=stage, error=None, **extra)
 
     def log(message: str) -> None:
         store.append_log(job_id, message)
 
     def checkpoint() -> None:
+        gpu_checkpoint()
         current = store.get(job_id) or {}
         action = current.get("control")
         if action == "pause":
@@ -458,6 +528,13 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 cue.update({"id": index, "speaker": "Identifying…", "status": "waiting"})
             cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
             shutil.rmtree(folder / "speech-chunks", ignore_errors=True)
+        alignment_restored = hydrate_alignment_confidence(cues)
+        if alignment_restored:
+            cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+            log(f"Restored measured forced-alignment evidence for {alignment_restored} cached line(s)")
+        if prepare_translation_revision(folder, cues):
+            cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+            log("Upgraded cached dialogue to source-faithful translation with independent subtitle evidence")
         speaker_placeholders_changed = False
         for cue in cues:
             if cue.get("speaker_id") is None and cue.get("speaker") != "Identifying…":
@@ -494,10 +571,44 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             measure_dialogue_leakage(cues, reference_audio, background_stem)
             cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
 
+        # Confirm the source transcript before anything is built on top of it.
+        # Everything downstream -- translation, its independent QC, the dub -- is
+        # only as true as this text, and until now nothing checked it against a
+        # second model except reactively, after a translation had already failed.
+        if any("source_asr_agreement" not in cue for cue in cues):
+            unverified = source_asr_verification_candidates(cues)
+            if unverified:
+                update(34.9, f"Confirming {len(unverified)} source line(s) with a second transcriber")
+                verification_folder = folder / "source-verification"
+                verification_folder.mkdir(exist_ok=True)
+                with gpu_stage(folder, "Whisper source transcript verification", checkpoint,
+                               minimum_free_mb=5000):
+                    opinions = verify_translation_disputes(
+                        reference_audio, unverified, verification_folder,
+                        lambda value, index: update(34.9 + value * .05,
+                            f"Second transcription · line {index + 1} of {len(unverified)}"),
+                        checkpoint,
+                    )
+                disputed = apply_source_asr_agreement(cues, opinions)
+                for cue in cues:
+                    cue.setdefault("source_asr_agreement", None)
+                log(f"Independent transcription disputed {disputed} of {len(unverified)} "
+                    f"source line(s); both readings now travel forward as evidence")
+                cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+
         # Translation, emotion analysis, and TTS are deliberately sequential. This keeps
         # the full pipeline within the RTX 4060 Laptop GPU's 8 GB VRAM budget.
         release_whisper_models()
         speaker_reference_dir = folder / "speaker-references"
+        reference_marker = speaker_reference_dir / "reference-version.txt"
+        reference_version = "acoustic-variant-reference-v3"
+        prior_reference_version = (reference_marker.read_text(encoding="utf-8").strip()
+                                   if reference_marker.is_file() else "")
+        if prior_reference_version != reference_version:
+            shutil.rmtree(speaker_reference_dir, ignore_errors=True)
+            for cue in cues:
+                cue.pop("reference_quality", None)
+                cue.pop("reference_metrics", None)
         if any("speaker_id" not in cue for cue in cues) or not list(speaker_reference_dir.glob("voice-*.wav")):
             update(35, "Matching lines to consistent voices")
             diarization_audio = reference_audio
@@ -507,25 +618,47 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 diarization_folder = folder / "full-film-speaker-registry"
                 diarization_folder.mkdir(exist_ok=True)
                 diarization_audio = diarization_folder / "full-film-context-16k.flac"
-                if not diarization_audio.is_file():
-                    update(34.9, "Preparing whole-film voice context")
-                    run("ffmpeg", "-y", "-v", "error", "-i", str(original_source),
-                        "-map", f"0:{working_audio['index']}",
-                        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", str(diarization_audio))
                 diarization_cues = copy.deepcopy(cues)
                 for cue in diarization_cues:
                     cue["start"] = float(cue["start"]) + range_start
                     cue["end"] = float(cue["end"]) + range_start
                 update(35, "Registering voices from the whole film")
                 diarization_cache_artifact = (
-                    f"speaker-diarization-community1-v2-stream-{working_audio['index']}.json"
+                    f"speaker-diarization-community1-v3-stream-{working_audio['index']}.json"
                 )
                 restored_diarization = restore_json_artifact(
                     folder, fingerprint, diarization_cache_artifact,
-                    diarization_folder / "speaker-diarization.json", expected_version=2,
+                    diarization_folder / "speaker-diarization.json", expected_version=3,
                 )
+                if not restored_diarization:
+                    legacy_artifact = f"speaker-diarization-community1-v2-stream-{working_audio['index']}.json"
+                    restored_legacy = restore_json_artifact(
+                        folder, fingerprint, legacy_artifact,
+                        diarization_folder / "speaker-diarization.json", expected_version=2,
+                    )
+                    if restored_legacy:
+                        migrated = json.loads((diarization_folder / "speaker-diarization.json").read_text(
+                            encoding="utf-8"))
+                        migrated["version"] = 3
+                        migrated.setdefault("analysis", {})["execution"] = (
+                            "reused trusted whole-film result created before chunked CUDA"
+                        )
+                        temporary = diarization_folder / "speaker-diarization.json.tmp"
+                        temporary.write_text(json.dumps(migrated, ensure_ascii=False, indent=2), encoding="utf-8")
+                        temporary.replace(diarization_folder / "speaker-diarization.json")
+                        store_json_artifact(
+                            folder, fingerprint, diarization_cache_artifact,
+                            diarization_folder / "speaker-diarization.json", expected_version=3,
+                        )
+                        restored_diarization = True
+                        log("Upgraded and reused the prior completed whole-film speaker analysis")
                 if restored_diarization:
                     log("Reused the prior whole-film voice-turn analysis for this exact soundtrack")
+                elif not diarization_audio.is_file():
+                    update(34.9, "Preparing whole-film voice context")
+                    run("ffmpeg", "-y", "-v", "error", "-i", str(original_source),
+                        "-map", f"0:{working_audio['index']}",
+                        "-vn", "-ac", "1", "-ar", "16000", "-c:a", "flac", str(diarization_audio))
             diarization = diarize(
                 diarization_audio, diarization_folder,
                 lambda value: update(35 + value * 1.2, f"Mapping speaker turns · {value * 100:.0f}%"), checkpoint,
@@ -533,7 +666,7 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             if diarization and selected_range and not restored_diarization:
                 store_json_artifact(
                     folder, fingerprint, diarization_cache_artifact,
-                    diarization_folder / "speaker-diarization.json", expected_version=2,
+                    diarization_folder / "speaker-diarization.json", expected_version=3,
                 )
             if diarization:
                 assign_diarized_speakers(diarization_cues, diarization)
@@ -567,28 +700,124 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                     f"{visual.get('created_visual_voices', 0)} anonymous visual voice(s)")
             else:
                 log("No reliable visual speaker anchors; retained full-film audio assignments")
-            analyze_speakers(reference_audio, cues, speaker_reference_dir)
+            with gpu_stage(folder, "CAMPPlus speaker reference scoring", checkpoint, minimum_free_mb=3000):
+                analyze_speakers(reference_audio, cues, speaker_reference_dir)
+            reference_marker.write_text(reference_version, encoding="utf-8")
             cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
             update(37, f"Matched {len(set(cue['speaker_id'] for cue in cues))} source voices", cues=cues)
+        reference_variants = load_reference_variants(speaker_reference_dir)
         speaker_references = {
             int(path.stem.split("-")[-1]): path for path in speaker_reference_dir.glob("voice-*.wav")
         }
+        allocate_dub_windows(cues, duration)
+        cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
         if any("adaptation_confidence" not in cue for cue in cues):
             update(37.2, "Adapting dialogue for meaning, timing, and natural speech")
-            cues = adapt_dialogue(
-                cues, folder,
-                lambda value, index: update(37.2 + value * 0.7,
-                    f"Adapting difficult line {index + 1} of {len(cues)}"), checkpoint,
-            )
+            with gpu_stage(folder, "Hy-MT2 dialogue adaptation", checkpoint, minimum_free_mb=6000):
+                cues = adapt_dialogue(
+                    cues, folder,
+                    lambda value, index: update(37.2 + value * 0.7,
+                        f"Translating and adapting dialogue · line {index + 1} of {len(cues)}"), checkpoint,
+                )
             cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
-        if any("translation_qc" not in cue for cue in cues):
+        if any((cue.get("translation_qc") or {}).get("revision") != TRANSLATION_QC_REVISION
+               for cue in cues):
             update(37.8, "Independently checking translation accuracy")
-            cues = validate_translations(
-                cues, folder,
-                lambda value, index: update(37.8 + value * .2,
-                    f"Independent bilingual QC · line {index + 1} of {len(cues)}"), checkpoint,
-            )
+            with gpu_stage(folder, "Qwen bilingual translation QC", checkpoint, minimum_free_mb=6000):
+                cues = validate_translations(
+                    cues, folder,
+                    lambda value, index: update(37.8 + value * .2,
+                        f"Independent bilingual QC · line {index + 1} of {len(cues)}"), checkpoint,
+                )
             cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+        disputes = translation_dispute_candidates(cues)
+        if disputes:
+            update(37.81, f"Resolving {len(disputes)} uncertain subtitle/ASR disagreement(s)")
+            with gpu_stage(folder, "Whisper selective ASR dispute check", checkpoint,
+                           minimum_free_mb=5000):
+                second_opinions = verify_translation_disputes(
+                    reference_audio, disputes, folder,
+                    lambda value, index: update(37.81 + value * .01,
+                        f"Second transcription · line {index + 1} of {len(disputes)}"), checkpoint,
+                )
+            disputed_ids = set(second_opinions)
+            for cue in cues:
+                cue_id = int(cue["id"])
+                if cue_id in disputed_ids:
+                    cue["asr_second_opinion"] = second_opinions[cue_id]
+            cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+        evidence_cues = second_asr_evidence_candidates(cues)
+        if evidence_cues:
+            with gpu_stage(folder, "Hy-MT2 second-ASR evidence translation", checkpoint,
+                           minimum_free_mb=6000):
+                evidence = translate_second_asr_evidence(
+                    evidence_cues, folder,
+                    lambda value, index: update(37.82 + value * .01,
+                        f"Translating second transcription · {index + 1} of {len(evidence_cues)}"),
+                    checkpoint,
+                )
+            evidence_ids = set(evidence)
+            for cue in cues:
+                cue_id = int(cue["id"])
+                if cue_id in evidence_ids:
+                    cue["asr_second_opinion"]["english_translation"] = evidence[cue_id]["text"]
+                    cue["asr_second_opinion"]["translation_model"] = evidence[cue_id]["model"]
+                    cue.pop("translation_qc", None)
+            evidence_subset = [cue for cue in cues if int(cue["id"]) in evidence_ids]
+            with gpu_stage(folder, "Qwen second-opinion translation QC", checkpoint,
+                           minimum_free_mb=6000):
+                validate_translations(
+                    evidence_subset, folder,
+                    lambda value, index: update(37.83 + value * .01,
+                        f"Rechecking disputed translation · {index + 1} of {len(evidence_subset)}"),
+                    checkpoint,
+                )
+            cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+        for correction_round in range(3):
+            failed_ids = {int(cue["id"]) for cue in cues
+                          if (not bool((cue.get("translation_qc") or {}).get("passed"))
+                              and int(cue.get("translation_correction_attempts") or 0) < 3)}
+            if not failed_ids:
+                break
+            log(f"Independent bilingual QC rejected {len(failed_ids)} line(s); "
+                f"running automatic correction pass {correction_round + 1} of 3")
+            for cue in cues:
+                if int(cue["id"]) not in failed_ids:
+                    cue["_skip_adaptation"] = True
+                    continue
+                cue.pop("_skip_adaptation", None)
+                cue["translation_qc_feedback"] = str(
+                    (cue.get("translation_qc") or {}).get("reason") or "meaning was not independently verified"
+                )
+                cue["force_translation_correction"] = True
+                cue["force_adaptation"] = True
+                cue["translation_correction_attempts"] = int(
+                    cue.get("translation_correction_attempts") or 0) + 1
+                cue.pop("translation_qc", None)
+            with gpu_stage(folder, f"Hy-MT2 translation correction {correction_round + 1}/3",
+                           checkpoint, minimum_free_mb=6000):
+                cues = adapt_dialogue(
+                    cues, folder,
+                    lambda value, index: update(37.82 + correction_round * .05 + value * .02,
+                        f"Correcting rejected translation · line {index + 1} of {len(cues)}"), checkpoint,
+                )
+            for cue in cues:
+                cue.pop("_skip_adaptation", None)
+            failed_subset = [cue for cue in cues if int(cue["id"]) in failed_ids]
+            with gpu_stage(folder, f"Qwen translation correction QC {correction_round + 1}/3",
+                           checkpoint, minimum_free_mb=6000):
+                judged_subset = validate_translations(
+                    failed_subset, folder,
+                    lambda value, index: update(37.86 + correction_round * .05 + value * .02,
+                        f"Rechecking corrected translation · {index + 1} of {len(failed_subset)}"), checkpoint,
+                )
+            judged_by_id = {int(cue["id"]): cue.get("translation_qc") for cue in judged_subset}
+            for cue in cues:
+                if int(cue["id"]) in judged_by_id:
+                    cue["translation_qc"] = judged_by_id[int(cue["id"])]
+            cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
+        allocate_dub_windows(cues, duration)
+        cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
         emotion_mode = options.get("emotion_mode", "auto")
         if any("emotion_vector" not in cue for cue in cues):
             update(38, "Reading emotion from each scene")
@@ -620,6 +849,16 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         emotion_refs.mkdir(exist_ok=True)
         generated.mkdir(exist_ok=True)
         fitted.mkdir(exist_ok=True)
+        timing_version = "measured-duration-v3"
+        timing_marker = folder / "tts-timing-version.txt"
+        prior_timing_version = (timing_marker.read_text(encoding="utf-8").strip()
+                                if timing_marker.is_file() else "")
+        if prior_timing_version != timing_version:
+            for stale in (generated, fitted, folder / "qwen-generated", folder / "qwen-fitted",
+                          folder / "acoustically-matched"):
+                shutil.rmtree(stale, ignore_errors=True)
+                stale.mkdir(exist_ok=True)
+        timing_marker.write_text(timing_version, encoding="utf-8")
         total = len(cues)
         glossary = options.get("glossary") or {}
         def apply_glossary(text: str) -> str:
@@ -649,32 +888,56 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             # reconciliation, but synthesize from this cue's own source voice.
             reference = (speaker_references.get(int(cue.get("speaker_id", 0)))
                          if float(cue.get("speaker_confidence", 0.0)) >= 0.62 else None)
-            if reference is None:
+            if reference is not None:
+                # Clone this line from the take of this character that actually
+                # sounds like this line, rather than from one clip for the film.
+                reference, basis = select_reference(
+                    cue, reference_variants.get(int(cue.get("speaker_id", 0)), []), reference)
+                cue["reference_basis"] = basis
+            else:
                 reference = fallback_refs / f"{line_number:06d}.wav"
+                cue["reference_basis"] = "this line's own source voice"
             raw_line = generated / f"{line_number:06d}.wav"
             fitted_line = fitted / f"{line_number:06d}.wav"
             emotion_reference = emotion_refs / f"{line_number:06d}.wav"
-            target = max(0.24, float(cue["end"]) - float(cue["start"]))
+            target = max(0.24, float(cue.get("dub_end", cue["end"]))
+                         - float(cue.get("dub_start", cue["start"])))
             if not reference.exists():
                 make_reference(reference_audio, cue, reference, duration)
+            reference_text = str(cue.get("source") or "").strip()
+            reference_metadata = reference.with_suffix(".json")
+            if reference_metadata.is_file():
+                try:
+                    reference_text = str(json.loads(reference_metadata.read_text(
+                        encoding="utf-8")).get("reference_text") or reference_text).strip()
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
             source_performance_ok = (
                 emotion_mode in {"auto", "source"}
-                and float(cue.get("reference_quality", 0.0)) >= 0.001
+                and float(cue.get("reference_quality", 0.0)) >= 0.30
                 and target >= 0.5
             )
             if source_performance_ok and not emotion_reference.exists():
                 make_reference(reference_audio, cue, emotion_reference, duration, minimum=0.5, padding=0.15)
             cue["performance_source"] = "source performance" if source_performance_ok else "scene context"
+            # Conditioning strength must follow the evidence, not the mode name.
+            # The actor's own delivery of this line is the ground truth and is
+            # trusted hard; a vector inferred from scene text is a guess and is
+            # deliberately not over-committed to.
+            emotion_strength = (SOURCE_EMOTION_STRENGTH if source_performance_ok
+                                else 0.6 if emotion_mode == "auto" else 0.82)
+            cue["emotion_strength"] = emotion_strength
             spoken_text = apply_glossary(cue["english"])
             cue["spoken_text"] = spoken_text
             tts_items.append({
                 "text": spoken_text, "reference": str(reference), "raw": str(raw_line),
                 "fitted": str(fitted_line), "target": target,
                 "emotion_vector": None if source_performance_ok else cue.get("emotion_vector"),
-                "emotion_strength": 0.6 if emotion_mode == "auto" else 0.82,
+                "emotion_strength": emotion_strength,
                 "emotion_audio": str(emotion_reference) if source_performance_ok else None,
                 "language": target_language_code(options.get("target_language", "English")),
-                "cue_index": index,
+                "cue_index": index, "reference_text": reference_text,
+                "fit_limit_percent": 5.0 if cue.get("mouth_visible") else 8.0,
             })
 
         def voice_progress(event: dict) -> None:
@@ -688,8 +951,13 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 "raw_duration": event.get("raw_duration"),
                 "stretch_percent": event.get("stretch_percent"),
                 "active_duration": event.get("active_duration"),
+                "speech_span_duration": event.get("speech_span_duration"),
                 "active_fill_percent": event.get("active_fill_percent"),
                 "padding_ms": event.get("padding_ms"),
+                "truncated_ms": event.get("truncated_ms"),
+                "duration_error_percent": event.get("duration_error_percent"),
+                "duration_factor": event.get("duration_factor"),
+                "timing_pass": event.get("timing_pass"),
                 "phrase_count": event.get("phrase_count"),
             }
             persist_cues(completed_index)
@@ -703,8 +971,9 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
 
         timing_failures = [
             index for index, cue in enumerate(cues)
-            if abs(float(cue.get("qc", {}).get("stretch_percent") or 0.0))
-            > (5.0 if cue.get("mouth_visible") else 8.0)
+            if (cue.get("qc", {}).get("timing_pass") is not True
+                or float(cue.get("qc", {}).get("padding_ms") or 0.0) > 160
+                or float(cue.get("qc", {}).get("truncated_ms") or 0.0) > 40)
         ]
         if timing_failures:
             update(80.2, f"Rewriting {len(timing_failures)} line(s) that failed timing QC")
@@ -720,14 +989,22 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             for cue in cues:
                 cue.pop("_skip_adaptation", None)
             retry_items = []
+            rewritten: list[int] = []
             for index in timing_failures:
                 raw = generated / f"{index + 1:06d}.wav"
                 fitted_line = fitted / f"{index + 1:06d}.wav"
                 raw.unlink(missing_ok=True)
                 fitted_line.unlink(missing_ok=True)
                 item = dict(tts_items[index])
+                previous_text = cues[index].get("spoken_text")
                 cues[index]["spoken_text"] = apply_glossary(cues[index]["english"])
                 item["text"] = cues[index]["spoken_text"]
+                if cues[index]["spoken_text"] != previous_text:
+                    # The wording changed under timing pressure, which is exactly
+                    # when meaning gets dropped.  The verdict this line earned
+                    # belongs to the old wording and must not survive the rewrite.
+                    cues[index].pop("translation_qc", None)
+                    rewritten.append(index)
                 retry_items.append(item)
 
             def retry_progress(event: dict) -> None:
@@ -737,8 +1014,13 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                     "raw_duration": event.get("raw_duration"),
                     "stretch_percent": event.get("stretch_percent"),
                     "active_duration": event.get("active_duration"),
+                    "speech_span_duration": event.get("speech_span_duration"),
                     "active_fill_percent": event.get("active_fill_percent"),
                     "padding_ms": event.get("padding_ms"),
+                    "truncated_ms": event.get("truncated_ms"),
+                    "duration_error_percent": event.get("duration_error_percent"),
+                    "duration_factor": event.get("duration_factor"),
+                    "timing_pass": event.get("timing_pass"),
                     "phrase_count": event.get("phrase_count"),
                     "adapted_retry": True,
                 }
@@ -750,6 +1032,18 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 synthesize_voice_lines({"engine": options.get("engine", "indextts"), "items": retry_items},
                                        folder, retry_progress, checkpoint)
             persist_cues(force=True)
+            if rewritten:
+                update(80.85, f"Rechecking {len(rewritten)} line(s) rewritten for timing")
+                rewritten_subset = [cues[index] for index in rewritten]
+                with gpu_stage(folder, "Qwen QC for timing rewrites", checkpoint,
+                               minimum_free_mb=6000):
+                    validate_translations(
+                        rewritten_subset, folder,
+                        lambda value, index: update(80.85 + value * .05,
+                            f"Rechecking rewritten meaning · {index + 1} of {len(rewritten_subset)}"),
+                        checkpoint,
+                    )
+                persist_cues(force=True)
 
         update(80.9, "Checking generated words against the intended dialogue")
         with gpu_stage(folder, "Whisper spoken-word QC", checkpoint):
@@ -781,8 +1075,13 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                     "raw_duration": event.get("raw_duration"),
                     "stretch_percent": event.get("stretch_percent"),
                     "active_duration": event.get("active_duration"),
+                    "speech_span_duration": event.get("speech_span_duration"),
                     "active_fill_percent": event.get("active_fill_percent"),
                     "padding_ms": event.get("padding_ms"),
+                    "truncated_ms": event.get("truncated_ms"),
+                    "duration_error_percent": event.get("duration_error_percent"),
+                    "duration_factor": event.get("duration_factor"),
+                    "timing_pass": event.get("timing_pass"),
                     "phrase_count": event.get("phrase_count"),
                     "word_retry": True,
                 })
@@ -803,12 +1102,87 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         # Measure identity before deciding whether the secondary engine is useful;
         # fallback is not limited to pronunciation failures.
         score_speaker_similarity(cues, fitted, speaker_references)
+        measure_performance_similarity(cues, fitted)
+        # Acting and register failures are answered by asking the *cloning*
+        # engine again with the actor's own delivery weighted harder, before any
+        # second engine is considered.  A different engine carries no source
+        # performance prompt at all, so reaching for it first would trade the
+        # thing being repaired for the thing that was already right.
+        performance_failures = [
+            index for index, cue in enumerate(cues)
+            if float(cue["end"]) - float(cue["start"]) >= 1.0
+            and str(cue.get("performance_source")) == "source performance"
+            and (float(cue.get("qc", {}).get("performance_similarity", 1.0)) < PERFORMANCE_RETAKE_THRESHOLD
+                 or float(cue.get("qc", {}).get("pitch_delta_semitones") or 0.0) > PITCH_TOLERANCE_SEMITONES)
+        ]
+        if performance_failures:
+            update(81.4, f"Re-performing {len(performance_failures)} line(s) to match the original delivery")
+            retake_dir = folder / "performance-retakes"; retake_raw = folder / "performance-retake-raw"
+            retake_dir.mkdir(exist_ok=True); retake_raw.mkdir(exist_ok=True)
+            retake_items = []
+            for index in performance_failures:
+                item = dict(tts_items[index])
+                item.update({
+                    "raw": str(retake_raw / f"{index + 1:06d}.wav"),
+                    "fitted": str(retake_dir / f"{index + 1:06d}.wav"),
+                    "emotion_strength": RETAKE_EMOTION_STRENGTH,
+                    # Sampling variance fights identity; a retake for accuracy is
+                    # never a random reroll.
+                    "use_random": False, "cue_index": index,
+                })
+                retake_items.append(item)
+            retake_metrics: dict[int, dict] = {}
+
+            def retake_progress(event: dict) -> None:
+                cue_index = int(event.get("cue_index", event["index"]))
+                retake_metrics[cue_index] = event
+                update(81.4 + float(event["progress"]) * .1,
+                       f"Re-performing line {cue_index + 1}", current_cue=cue_index + 1)
+
+            with gpu_stage(folder, "IndexTTS performance retakes", checkpoint):
+                synthesize_voice_lines(
+                    {"engine": options.get("engine", "indextts"), "items": retake_items},
+                    folder, retake_progress, checkpoint,
+                )
+            retake_cues = copy.deepcopy(cues)
+            for index, metrics in retake_metrics.items():
+                retake_cues[index].setdefault("qc", {}).update(metrics)
+            retake_qc = folder / "performance-retake-qc"; retake_qc.mkdir(exist_ok=True)
+            with gpu_stage(folder, "Whisper performance-retake QC", checkpoint):
+                backtranscribe_lines(retake_cues, retake_dir, retake_qc,
+                    lambda value, index: update(81.5 + value * .05,
+                        f"Checking re-performed line {index + 1}"), checkpoint)
+            score_speaker_similarity(retake_cues, retake_dir, speaker_references)
+            measure_performance_similarity(retake_cues, retake_dir)
+            kept = 0
+            for index in performance_failures:
+                current = cues[index].get("qc", {}); retake = retake_cues[index].get("qc", {})
+                # Expression is never bought with intelligibility: a retake must
+                # not drop the line below the bar the word QC already enforces.
+                intelligible = (float(retake.get("word_similarity") or 0.0)
+                                >= min(float(current.get("word_similarity") or 0.0), .58))
+                current_score = (.45 * float(current.get("performance_similarity", .5))
+                                 + .35 * float(current.get("speaker_similarity", .5))
+                                 + .20 * float(current.get("word_similarity", 0)))
+                retake_score = (.45 * float(retake.get("performance_similarity", .5))
+                                + .35 * float(retake.get("speaker_similarity", .5))
+                                + .20 * float(retake.get("word_similarity", 0)))
+                if intelligible and retake_score > current_score + .02:
+                    shutil.copy2(retake_dir / f"{index + 1:06d}.wav", fitted / f"{index + 1:06d}.wav")
+                    cues[index]["qc"] = retake
+                    cues[index]["qc"]["performance_retake"] = True
+                    cues[index]["qc"]["performance_retake_margin"] = round(retake_score - current_score, 3)
+                    kept += 1
+            log(f"Performance retakes improved {kept} of {len(performance_failures)} line(s)")
+            persist_cues(force=True)
         fallback_failures = [
             index for index, cue in enumerate(cues)
             if ((float(cue.get("qc", {}).get("word_similarity") or 0.0) < .8
                  and int(cue.get("qc", {}).get("tts_attempts", 1)) >= 2)
                 or (float(cue.get("qc", {}).get("speaker_similarity") or 0.0) < .55
-                    and float(cue.get("qc", {}).get("active_duration", 0.0)) >= .8))
+                    and float(cue.get("qc", {}).get("active_duration", 0.0)) >= .8)
+                or (float(cue.get("qc", {}).get("performance_similarity", 1.0)) < .45
+                    and float(cue["end"]) - float(cue["start"]) >= 1.0))
         ]
         if fallback_failures:
             update(81.45, f"Comparing a second speech engine for {len(fallback_failures)} difficult line(s)")
@@ -851,15 +1225,30 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                             f"Checking alternative take · line {index + 1} of {total}"), checkpoint)
                 score_speaker_similarity(cues, fitted, speaker_references)
                 score_speaker_similarity(qwen_cues, qwen_dir, speaker_references)
+                measure_performance_similarity(cues, fitted)
+                measure_performance_similarity(qwen_cues, qwen_dir)
                 for index in fallback_failures:
                     current = cues[index].get("qc", {}); alternate = qwen_cues[index].get("qc", {})
-                    current_score = (.55 * float(current.get("word_similarity", 0))
-                                     + .3 * float(current.get("speaker_similarity", .5))
-                                     + .15 * (1 - min(1.0, abs(float(current.get("stretch_percent", 0))) / 12)))
-                    alternate_score = (.55 * float(alternate.get("word_similarity", 0))
-                                       + .3 * float(alternate.get("speaker_similarity", .5))
-                                       + .15 * (1 - min(1.0, abs(float(alternate.get("stretch_percent", 0))) / 12)))
-                    if alternate_score > current_score + .025:
+                    current_score = (.4 * float(current.get("word_similarity", 0))
+                                     + .25 * float(current.get("speaker_similarity", .5))
+                                     + .25 * float(current.get("performance_similarity", .5))
+                                     + .1 * float(current.get("timing_pass", False)))
+                    alternate_score = (.4 * float(alternate.get("word_similarity", 0))
+                                       + .25 * float(alternate.get("speaker_similarity", .5))
+                                       + .25 * float(alternate.get("performance_similarity", .5))
+                                       + .1 * float(alternate.get("timing_pass", False)))
+                    # The fallback engine clones timbre but receives no source
+                    # performance prompt, so it must not win a line by fluency
+                    # while quietly discarding the actor's delivery or register.
+                    keeps_performance = (
+                        float(alternate.get("performance_similarity", .5))
+                        >= float(current.get("performance_similarity", .5)) - .02)
+                    keeps_register = (
+                        float(alternate.get("pitch_delta_semitones") or 0.0)
+                        <= max(PITCH_TOLERANCE_SEMITONES,
+                               float(current.get("pitch_delta_semitones") or 0.0)))
+                    if (alternate_score > current_score + .025
+                            and keeps_performance and keeps_register):
                         shutil.copy2(qwen_dir / f"{index + 1:06d}.wav", fitted / f"{index + 1:06d}.wav")
                         cues[index]["qc"] = alternate
                         cues[index]["qc"]["tts_engine"] = "Qwen3-TTS 1.7B Base fallback"
@@ -870,6 +1259,14 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         matched = folder / "acoustically-matched"
         update(82, "Matching dialogue tone, distance, and room sound")
         match_acoustics(cues, fitted, matched, reference_audio)
+        clean_background = background_stem
+        if audio_mode == "separate" and background_stem.is_file():
+            update(82.4, "Removing residual source dialogue from the music-and-effects bed")
+            clean_background = suppress_dialogue_leakage(
+                cues, reference_audio, background_stem, folder / "background-dialogue-suppressed.flac"
+            ) or background_stem
+        for cue in cues:
+            cue["overlap_source_preserved"] = False
         update(82.6, "Running automatic line quality checks")
         cue_qc = inspect_cues(cues, matched)
         cues_path.write_text(json.dumps(cues, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -881,8 +1278,8 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
 
         mixed = folder / "english-mix.flac"
         update(89, "Balancing dialogue with the source soundtrack")
-        mastering = mix_audio(working_soundtrack, voice, mixed, duration, audio_mode, background_stem,
-                              options.get("mastering_preset", "cinema"))
+        mastering = mix_audio(working_soundtrack, voice, mixed, duration, audio_mode, clean_background,
+                              options.get("mastering_preset", "cinema"), cues)
 
         output = folder / "dubbed-english.mkv"
         try:
@@ -949,12 +1346,28 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         store.update(job_id, status="cancelled", stage="Cancelled", control=None,
                      active_processing_seconds=round(active_seconds(), 1), active_run_started_at=None)
         log("Job cancelled; intermediate files were kept until removal")
+    except GPUStageUnsafe as exc:
+        attempts = int((store.get(job_id) or {}).get("thermal_resume_count") or 0) + 1
+        try:
+            limit = max(0, int(os.getenv("DUB_GPU_AUTO_RESUME_LIMIT", "12")))
+        except ValueError:
+            limit = 12
+        automatic = attempts <= limit
+        stage = ("Cooling GPU safely · will resume automatically" if automatic else
+                 "Paused to protect the GPU · automatic retry limit reached")
+        store.update(job_id, status="paused", stage=stage, error=str(exc), control=None,
+                     auto_resume_pending=automatic, thermal_resume_count=attempts,
+                     active_processing_seconds=round(active_seconds(), 1), active_run_started_at=None)
+        log(f"CUDA safety pause: {exc}. Completed analysis and lines were kept; "
+            + ("the job will resume after a stable cooldown." if automatic else
+               "manual review is required after repeated thermal stops."))
     except Exception as exc:
         store.update(job_id, status="error", stage="Needs attention", error=f"{type(exc).__name__}: {exc}", control=None,
                      active_processing_seconds=round(active_seconds(), 1), active_run_started_at=None)
         log(f"Pipeline stopped: {type(exc).__name__}: {exc}")
     finally:
         _run_context.checkpoint = None
+        release_job_lock(execution_lock)
 
 
 def build_cues(source: Path, audio: Path, folder: Path, job: dict, probe: dict, options: dict,
@@ -1031,6 +1444,61 @@ def build_cues(source: Path, audio: Path, folder: Path, job: dict, probe: dict, 
     return cues, f"{engine} source transcript" + (f" · guided by {source_label}" if source_label else "")
 
 
+def prepare_translation_revision(folder: Path, cues: list[dict]) -> bool:
+    """Invalidate only translation-dependent work when semantics are upgraded."""
+    revision = "subtitle-provenance-source-faithful-v4"
+    marker = folder / "translation-logic-version.txt"
+    if marker.is_file() and marker.read_text(encoding="utf-8").strip() == revision:
+        return False
+    cards = parse_srt(folder / "selected-subtitles.srt") if (folder / "selected-subtitles.srt").is_file() else []
+    for cue in cues:
+        cue_start = float(cue.get("subtitle_start", cue.get("start", 0.0)))
+        cue_end = float(cue.get("subtitle_end", cue.get("end", cue_start)))
+        candidates = []
+        if cue.get("subtitle_start") is not None:
+            for card in cards:
+                overlap = min(cue_end, float(card["end"])) - max(cue_start, float(card["start"]))
+                if overlap > 0:
+                    candidates.append((overlap, str(card.get("text", ""))))
+        supplied = max(candidates)[1] if candidates else (
+            cue.get("supplied_translation") if cue.get("subtitle_start") is not None else None
+        )
+        if (supplied and len(cue.get("words", [])) <= 2
+                and __import__('re').search(
+                    r"(?:\d|[$£€¥]|\byen\b|\btickets?\b|\badmission\b|\s[-–—]\s)",
+                    str(supplied), flags=__import__('re').I)):
+            cue["display_caption_ignored_for_dubbing"] = supplied
+            supplied = None
+        if supplied:
+            cue["supplied_translation"] = supplied
+            cue["translation_was_supplied"] = True
+            cue["literal_translation"] = supplied
+            cue["english"] = supplied
+            cue["adapted_dialogue"] = supplied
+        else:
+            cue.pop("supplied_translation", None)
+            cue["translation_was_supplied"] = False
+            cue["translation_is_target"] = False
+            cue["literal_translation"] = str(cue.get("source") or "")
+            cue["english"] = str(cue.get("source") or "")
+            cue["adapted_dialogue"] = str(cue.get("source") or "")
+        for key in ("faithful_translation", "translation_model", "translation_candidates",
+                    "candidate_semantic_scores", "adaptation_confidence", "adaptation_attempts",
+                    "adaptation_model", "adaptation_scoring", "translation_qc",
+                    "translation_qc_feedback", "force_translation_correction",
+                    "asr_second_opinion"):
+            cue.pop(key, None)
+        cue.pop("translation_correction_attempts", None)
+        cue["force_adaptation"] = False
+    for directory in ("generated", "fitted", "qwen-generated", "qwen-fitted", "acoustically-matched"):
+        shutil.rmtree(folder / directory, ignore_errors=True)
+    for name in ("english-dialogue.flac", "clean-background.flac", "dubbed-mix.flac",
+                 "dubbed-english.mkv", "qc-report.json", "qc-report.html"):
+        (folder / name).unlink(missing_ok=True)
+    marker.write_text(revision, encoding="utf-8")
+    return True
+
+
 def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list[dict]:
     """Treat subtitle cards as translation evidence and ASR/VAD as speech timing evidence."""
     words_by_card: dict[int, list[dict]] = {index: [] for index in range(len(subtitles))}
@@ -1046,12 +1514,15 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
             if distance <= 0.55:
                 words_by_card[index].append(word)
     result = []
+    spoken_subtitle_indices: set[int] = set()
     for subtitle_index, subtitle in enumerate(subtitles):
         start, end = float(subtitle["start"]), float(subtitle["end"])
         matching = [cue for cue in asr if min(end, float(cue["end"])) - max(start, float(cue["start"])) > 0.04]
         text = subtitle["text"]
         if matching:
             confidence = sum(float(cue.get("transcription_confidence", 0.0)) for cue in matching) / len(matching)
+            alignment_confidence = sum(float(cue.get("alignment_confidence", 0.0))
+                                       for cue in matching) / len(matching)
             words = sorted(words_by_card[subtitle_index], key=lambda word: float(word["start"]))
             if words:
                 speech_start = max(start - 0.5, min(float(word["start"]) for word in words))
@@ -1062,19 +1533,26 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
                 source_text = " ".join(str(cue.get("source", "")) for cue in matching).strip()
             timing_confidence = min(1.0, 0.55 + confidence * 0.45)
         else:
-            speech_start, speech_end, source_text, words, timing_confidence = start, end, "", [], 0.25
+            speech_start, speech_end, source_text, words = start, end, "", []
+            timing_confidence, alignment_confidence = 0.25, 0.0
         # Full subtitle tracks often contain title cards and character-name
         # captions.  When local ASR finds no speech or aligned words, concise
         # display-style text must remain a caption rather than becoming a TTS
         # line (e.g. "WATERBOYS" or "Suzuki").
         plain_words = __import__('re').findall(r"[A-Za-zÀ-ÿ0-9']+", text)
+        sign_like = bool(__import__('re').search(
+            r"(?:\d|[$£€¥]|\byen\b|\btickets?\b|\badmission\b|\s[-–—]\s)", text,
+            flags=__import__('re').I,
+        ))
         display_caption = (
             not matching and not words and 1 <= len(plain_words) <= 6
             and not __import__('re').search(r"[.!?。！？]", text)
             and (text.upper() == text or len(plain_words) == 1)
-        )
+        ) or (sign_like and len(words) <= 2 and len(plain_words) <= 8
+              and not __import__('re').search(r"[.!?。！？]", text))
         if display_caption:
             continue
+        spoken_subtitle_indices.add(subtitle_index)
         result.append({
             "start": round(speech_start, 3), "end": round(speech_end, 3),
             "subtitle_start": round(start, 3), "subtitle_end": round(end, 3),
@@ -1083,6 +1561,8 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
             "translation_is_target": True,
             "source_language": matching[0].get("source_language") if matching else None,
             "timing_confidence": round(timing_confidence, 3),
+            "alignment_confidence": round(alignment_confidence, 3),
+            "confidence_source": "forced-alignment validity reconciled with subtitle timing",
             "transcription_confidence": round(confidence if matching else 0.0, 3),
             "subtitle_speaker_hint": subtitle.get("subtitle_speaker_hint"),
             "card_speaker_index": subtitle.get("card_speaker_index", 0),
@@ -1092,7 +1572,9 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
     # Forced/signs-only English tracks must not suppress ordinary dialogue.
     for cue in asr:
         overlap = max((min(float(cue["end"]), float(card["end"])) -
-                       max(float(cue["start"]), float(card["start"])) for card in subtitles), default=0.0)
+                       max(float(cue["start"]), float(card["start"]))
+                       for index, card in enumerate(subtitles)
+                       if index in spoken_subtitle_indices), default=0.0)
         if overlap <= .05:
             extra = dict(cue)
             extra.setdefault("english", extra.get("source", ""))
@@ -1101,6 +1583,58 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
             result.append(extra)
     result.sort(key=lambda item: (float(item["start"]), int(item.get("card_speaker_index", 0))))
     return result
+
+
+def hydrate_alignment_confidence(cues: list[dict]) -> int:
+    """Migrate cached reconciled cues using their retained aligner evidence.
+
+    Qwen's aligned word objects already contain the validity-derived probability;
+    older reconciliation dropped only the cue-level aggregate. Reconstructing the
+    mean is measured evidence, not a favourable default.
+    """
+    restored = 0
+    for cue in cues:
+        if cue.get("alignment_confidence") is not None:
+            continue
+        probabilities = []
+        for word in cue.get("words", []):
+            try:
+                value = float(word["probability"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if 0.0 <= value <= 1.0:
+                probabilities.append(value)
+        if probabilities:
+            cue["alignment_confidence"] = round(sum(probabilities) / len(probabilities), 3)
+            cue["alignment_evidence"] = "mean retained Qwen forced-aligner word validity"
+            restored += 1
+    return restored
+
+
+def allocate_dub_windows(cues: list[dict], media_duration: float) -> None:
+    """Use measured speech plus subtitle/scene gaps to give English a safe window."""
+    ordered = sorted(cues, key=lambda item: (float(item["start"]), int(item.get("card_speaker_index", 0))))
+    for index, cue in enumerate(ordered):
+        source_start, source_end = float(cue["start"]), float(cue["end"])
+        next_start = min((float(other["start"]) for other in ordered[index + 1:]
+                          if float(other["start"]) > source_start + .02), default=media_duration)
+        subtitle_end = float(cue.get("subtitle_end") or source_end)
+        mouth_visible = bool(cue.get("mouth_visible"))
+        extension_cap = .25 if mouth_visible else 1.2
+        candidate_end = max(source_end, min(subtitle_end, source_end + extension_cap))
+        # Short acknowledgements need a producible window. They may overlap a
+        # different active speaker, but never steal time from the next turn.
+        minimum_end = source_start + (.45 if mouth_visible else .62)
+        if source_end - source_start < .55:
+            candidate_end = max(candidate_end, minimum_end)
+        if not cue.get("overlapping_speech"):
+            candidate_end = min(candidate_end, max(source_end, next_start - .03))
+        cue["dub_start"] = round(source_start, 3)
+        cue["dub_end"] = round(min(media_duration, max(source_end, candidate_end)), 3)
+        cue["dub_timing_basis"] = (
+            "forced-aligned source + subtitle/scene gap" if cue["dub_end"] > source_end + .01
+            else "forced-aligned source"
+        )
 
 
 def video_fps(probe: dict) -> float:
@@ -1139,6 +1673,243 @@ def release_whisper_models() -> None:
         torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+def translation_dispute_candidates(cues: list[dict]) -> list[dict]:
+    """Select only failed, low-confidence bilingual conflicts for expensive second ASR."""
+    selected = []
+    for cue in cues:
+        language = str(cue.get("source_language") or "").lower()
+        second = cue.get("asr_second_opinion") or {}
+        try:
+            confidence = float(cue.get("transcription_confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if (not bool((cue.get("translation_qc") or {}).get("passed"))
+                and bool(cue.get("supplied_translation"))
+                and confidence < .93
+                and language not in {"en", "eng", "english"}
+                and not str(second.get("text") or "").strip()):
+            selected.append(cue)
+    return selected
+
+
+def comparable_transcript(value: str) -> str:
+    """Reduce a transcript to comparable characters, in any script.
+
+    Punctuation, spacing and case differ freely between two ASR models reading
+    the same audio; what matters is whether they heard the same words.
+    """
+    import unicodedata
+
+    return "".join(character for character in unicodedata.normalize("NFKC", str(value)).casefold()
+                   if character.isalnum())
+
+
+def source_asr_verification_candidates(cues: list[dict]) -> list[dict]:
+    """Lines whose source transcript deserves an independent second reading.
+
+    The primary transcript comes from a 0.6B ASR, and its escalation to the
+    larger model triggers on alignment confidence: how cleanly the aligner fitted
+    the words it was handed, not whether those words were right.  A confidently
+    aligned mistranscription therefore never reaches the larger model, and every
+    stage downstream inherits it as fact.  An independent reading is the only
+    thing that catches it.
+    """
+    try:
+        limit = max(0, int(os.getenv("DUB_SOURCE_VERIFY_MAX_LINES", "1500")))
+    except ValueError:
+        limit = 1500
+    scored: list[tuple[float, int, dict]] = []
+    for index, cue in enumerate(cues):
+        if str(cue.get("source_language") or "").lower() in {"", "en", "eng", "english"}:
+            continue
+        if not str(cue.get("source") or "").strip():
+            continue
+        if float(cue.get("end", 0)) - float(cue.get("start", 0)) < .35:
+            continue
+        if str((cue.get("asr_second_opinion") or {}).get("text") or "").strip():
+            continue
+        # Rank by how little the primary can be trusted, so a capped run spends
+        # its budget where a mistranscription is most likely to be hiding.
+        risk = 1.0 - float(cue.get("transcription_confidence") or 0.0)
+        if not cue.get("asr_escalation_consulted"):
+            risk += .35
+        risk += max(0.0, .85 - float(cue.get("alignment_confidence") or 0.0))
+        scored.append((risk, index, cue))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [cue for _, _, cue in sorted(scored[:limit], key=lambda item: item[1])]
+
+
+def apply_source_asr_agreement(cues: list[dict], opinions: dict[int, dict]) -> int:
+    """Record the second reading and de-rate transcripts the two models dispute."""
+    import difflib
+
+    disputed = 0
+    for cue in cues:
+        opinion = opinions.get(int(cue["id"]))
+        if not opinion:
+            continue
+        cue["asr_second_opinion"] = opinion
+        primary = comparable_transcript(cue.get("source", ""))
+        second = comparable_transcript(opinion.get("text", ""))
+        agreement = difflib.SequenceMatcher(None, primary, second).ratio() if primary and second else 0.0
+        cue["source_asr_agreement"] = round(agreement, 3)
+        usable = (_measure(opinion.get("confidence"), 0.0) >= .5
+                  and _measure(opinion.get("word_confidence"), 0.0) >= .7
+                  # A perfect no-speech score is 0.0, which is falsy: defaulting
+                  # it away would reject exactly the most confident readings.
+                  and _measure(opinion.get("no_speech_probability"), 1.0) < .35)
+        if not usable or agreement >= .995:
+            continue
+        # Two independent models did not produce the same words.  Whether the
+        # difference changes the meaning is not something string distance can
+        # tell us -- in a logographic script one character separates "study"
+        # from "compensate", while a politeness particle changes nothing.  So
+        # this only records that the reading is contested and hands both to the
+        # bilingual judge downstream, which compares meanings rather than
+        # characters.  Only a wholesale disagreement de-rates far enough to ask
+        # for human eyes directly.
+        disputed += 1
+        cue["source_asr_disputed"] = True
+        ceiling = .5 if agreement < .5 else .7
+        cue["transcription_confidence"] = round(
+            min(_measure(cue.get("transcription_confidence"), 1.0), ceiling), 3)
+        cue["confidence_source"] = "contested by an independent Whisper reading"
+    return disputed
+
+
+def _measure(value, default: float) -> float:
+    """Read a numeric measurement, keeping a legitimate zero."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def second_asr_evidence_candidates(cues: list[dict]) -> list[dict]:
+    """Find second transcriptions that still need an explicit English meaning."""
+    return [cue for cue in cues
+            if str((cue.get("asr_second_opinion") or {}).get("text") or "").strip()
+            and not str((cue.get("asr_second_opinion") or {}).get("english_translation") or "").strip()]
+
+
+def translate_second_asr_evidence(cues: list[dict], folder: Path,
+                                  progress: Callable[[float, int], None],
+                                  checkpoint: Callable[[], None]) -> dict[int, dict]:
+    """Translate selective ASR evidence separately so the judge compares English meanings."""
+    model = Path(os.getenv(
+        "TRANSLATION_MODEL", "vendor/hy-mt2-7b/Hy-MT2-7B-Q4_K_M.gguf"
+    )).resolve()
+    if not model.is_file():
+        raise RuntimeError("The local Hy-MT2 evidence-translation model is missing")
+    items = [{
+        "id": int(cue["id"]),
+        "source": str(cue["asr_second_opinion"]["text"]),
+        "language": cue.get("source_language") or cue["asr_second_opinion"].get("language"),
+    } for cue in cues]
+    manifest_value = {"model": str(model), "items": items, "revision": "literal-evidence-v1"}
+    manifest_text = json.dumps(manifest_value, ensure_ascii=False, sort_keys=True)
+    signature = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+    signature_path = folder / "translation-evidence-input.sha256"
+    output = folder / "translation-evidence.json"
+    if signature_path.is_file() and signature_path.read_text(encoding="utf-8").strip() != signature:
+        output.unlink(missing_ok=True)
+    signature_path.write_text(signature, encoding="utf-8")
+    manifest = folder / "translation-evidence-manifest.json"
+    manifest.write_text(manifest_text, encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "app.services.translation_evidence_worker", "--manifest", str(manifest),
+         "--output", str(output)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    tail: list[str] = []
+    try:
+        for line in controlled_lines(process, checkpoint):
+            tail.append(line.rstrip()); tail = tail[-20:]
+            try:
+                event = json.loads(line)
+                progress(float(event["progress"]), int(event.get("index", 0)))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                pass
+        code = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            terminate_process(process)
+        raise
+    if code != 0 or not output.is_file():
+        raise RuntimeError("Second-ASR evidence translation failed: " + "\n".join(tail[-10:]))
+    values = json.loads(output.read_text(encoding="utf-8"))
+    return {int(item["id"]): item for item in values
+            if isinstance(item, dict) and item.get("id") is not None}
+
+
+def verify_translation_disputes(audio: Path, cues: list[dict], folder: Path,
+                                progress: Callable[[float, int], None],
+                                checkpoint: Callable[[], None]) -> dict[int, dict]:
+    """Re-transcribe only disputed lines with local CUDA Whisper Large-v3-Turbo."""
+    clips = folder / "translation-dispute-clips"
+    clips.mkdir(exist_ok=True)
+    language_codes = {
+        "japanese": "ja", "ja": "ja", "chinese": "zh", "zh": "zh",
+        "spanish": "es", "es": "es", "arabic": "ar", "ar": "ar",
+        "french": "fr", "fr": "fr", "german": "de", "de": "de",
+        "korean": "ko", "ko": "ko", "italian": "it", "it": "it",
+        "portuguese": "pt", "pt": "pt", "russian": "ru", "ru": "ru",
+    }
+    items = []
+    for cue in cues:
+        checkpoint()
+        cue_id = int(cue["id"])
+        start = max(0.0, float(cue.get("start", 0.0)) - .45)
+        end = max(start + .35, float(cue.get("end", start)) + .75)
+        target = clips / f"{cue_id:06d}.flac"
+        if not target.is_file() or target.stat().st_size < 256:
+            run("ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}",
+                "-t", f"{end - start:.3f}", "-i", str(audio), "-ac", "1", "-ar", "16000",
+                "-c:a", "flac", str(target))
+        language = str(cue.get("source_language") or "").lower()
+        items.append({"id": cue_id, "path": str(target), "language": language_codes.get(language)})
+    manifest_value = {
+        "model": "turbo",
+        "cache": str(Path(os.getenv("WHISPER_CACHE_DIR", "vendor/whisper")).resolve()),
+        "items": items,
+    }
+    manifest_text = json.dumps(manifest_value, ensure_ascii=False, sort_keys=True)
+    signature = hashlib.sha256(manifest_text.encode("utf-8")).hexdigest()
+    signature_path = folder / "translation-dispute-input.sha256"
+    output = folder / "translation-dispute-asr.json"
+    if signature_path.is_file() and signature_path.read_text(encoding="utf-8").strip() != signature:
+        output.unlink(missing_ok=True)
+    signature_path.write_text(signature, encoding="utf-8")
+    manifest = folder / "translation-dispute-manifest.json"
+    manifest.write_text(manifest_text, encoding="utf-8")
+    process = subprocess.Popen(
+        [sys.executable, "-m", "app.services.whisper_dispute_worker", "--manifest", str(manifest),
+         "--output", str(output)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, encoding="utf-8", errors="replace", bufsize=1,
+    )
+    tail: list[str] = []
+    try:
+        for line in controlled_lines(process, checkpoint):
+            tail.append(line.rstrip()); tail = tail[-20:]
+            try:
+                event = json.loads(line)
+                progress(float(event["progress"]), int(event.get("index", 0)))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                pass
+        code = process.wait()
+    except BaseException:
+        if process.poll() is None:
+            terminate_process(process)
+        raise
+    if code != 0 or not output.is_file():
+        raise RuntimeError("Selective Whisper dispute check failed: " + "\n".join(tail[-10:]))
+    values = json.loads(output.read_text(encoding="utf-8"))
+    return {int(item["id"]): item for item in values
+            if isinstance(item, dict) and item.get("id") is not None}
 
 
 def emotion_context(cues: list[dict], index: int) -> str:
@@ -1238,7 +2009,7 @@ def prepare_asr_windows(audio: Path, folder: Path, subtitle_hints: list[dict]) -
     else:
         detected = subprocess.run(
             ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio), "-af",
-             "silencedetect=noise=-42dB:d=0.35", "-f", "null", "NUL"],
+             "silencedetect=noise=-42dB:d=0.35", "-f", "null", os.devnull],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stderr
         silence_starts = [float(x) for x in __import__('re').findall(r"silence_start: ([0-9.]+)", detected)]
@@ -1328,9 +2099,7 @@ def render_timeline(cues: list[dict], fitted_dir: Path, output: Path, duration: 
                 cursor += len(mono)
         fade = max(1, round(.025 * SAMPLE_RATE))
         for cue in cues:
-            if cue.get("overlapping_speech"):
-                cue["overlap_source_preserved"] = True
-                continue
+            cue["overlap_source_preserved"] = False
             spans = [(float(word["start"]), float(word["end"])) for word in cue.get("words", [])
                      if word.get("start") is not None and word.get("end") is not None]
             if not spans:
@@ -1355,7 +2124,7 @@ def render_timeline(cues: list[dict], fitted_dir: Path, output: Path, duration: 
         if rate != SAMPLE_RATE:
             raise RuntimeError(f"Unexpected generated line sample rate: {rate}")
         frames = frames.mean(axis=1)
-        start = max(0, int(round(float(cue["start"]) * SAMPLE_RATE)))
+        start = max(0, int(round(float(cue.get("dub_start", cue["start"])) * SAMPLE_RATE)))
         end = min(sample_count, start + len(frames))
         if end > start:
             segment = frames[:end - start]
@@ -1419,6 +2188,16 @@ def match_acoustics(cues: list[dict], fitted_dir: Path, output_dir: Path,
                 offset = float(np.median(raw_gains))
                 match_gains = [float(np.clip(value - offset, -4.0, 4.0)) for value in raw_gains]
         filters = ["highpass=f=70", f"lowpass=f={lowpass}"]
+        # Residual register match, after the retakes have had their chance.
+        # Formant-preserving shifting moves the fundamental toward the actor
+        # without resizing the perceived vocal tract, so the cloned timbre is
+        # left intact.  Bounded on both sides: below the floor the difference is
+        # inaudible, above the ceiling the artefacts cost more than the match.
+        correction = register_correction(cue)
+        if correction is not None:
+            semitones, scale = correction
+            filters.append(f"rubberband=pitch={scale:.6f}:formant=preserved:pitchq=quality")
+            cue.setdefault("qc", {})["pitch_correction_semitones"] = semitones
         filters += [f"equalizer=f={center}:t=q:w=0.9:g={gain:.2f}"
                     for center, gain in zip(centers, match_gains) if abs(gain) >= .2]
         filters += ["deesser=i=0.18:m=0.28:f=0.5",
@@ -1447,12 +2226,13 @@ def match_acoustics(cues: list[dict], fitted_dir: Path, output_dir: Path,
 
 
 def mix_audio(source: Path, voice: Path, output: Path, duration: float, mode: str,
-              background: Path | None = None, mastering_preset: str = "cinema") -> dict:
+              background: Path | None = None, mastering_preset: str = "cinema",
+              cues: list[dict] | None = None) -> dict:
     premaster = output.with_name(output.stem + "-premaster.flac")
     if mode == "replace":
         run("ffmpeg", "-y", "-v", "error", "-i", str(voice), "-t", f"{duration:.3f}",
             "-ar", "48000", "-c:a", "flac", "-sample_fmt", "s32", str(premaster))
-        return master_audio(premaster, output, voice, mastering_preset)
+        return master_audio(premaster, output, voice, mastering_preset, cues)
     if mode == "separate" and background and background.is_file():
         bed_source = background
         bed_probe = probe_media(background)
@@ -1490,13 +2270,13 @@ def mix_audio(source: Path, voice: Path, output: Path, duration: float, mode: st
         )
     run("ffmpeg", "-y", "-v", "error", "-i", str(bed_source), "-i", str(voice), "-filter_complex", graph,
         "-map", "[mix]", "-t", f"{duration:.3f}", "-ar", "48000", "-c:a", "flac", "-sample_fmt", "s32", str(premaster))
-    return master_audio(premaster, output, voice, mastering_preset)
+    return master_audio(premaster, output, voice, mastering_preset, cues)
 
 
 def measured_lufs(path: Path) -> float | None:
     result = subprocess.run(
         ["ffmpeg", "-hide_banner", "-nostats", "-i", str(path), "-af",
-         "loudnorm=I=-24:TP=-2:LRA=18:print_format=json", "-f", "null", "NUL"],
+         "loudnorm=I=-24:TP=-2:LRA=18:print_format=json", "-f", "null", os.devnull],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
     )
     matches = __import__('re').findall(r"\{[^{}]+\}", result.stderr, flags=__import__('re').S)
@@ -1508,7 +2288,47 @@ def measured_lufs(path: Path) -> float | None:
         return None
 
 
-def master_audio(premaster: Path, output: Path, dialogue: Path, preset: str) -> dict:
+def dialogue_gated_lufs(premaster: Path, cues: list[dict]) -> float | None:
+    """Measure the finished mix over the spans where dialogue actually plays.
+
+    Program gain must be derived from the dialogue as it sits *in the mix*, not
+    from the isolated stem: the mix graph applies its own gain structure (amix
+    scales every input by 1/n), so a stem measurement is several dB adrift from
+    the level it is being used to set.  Gating on the real spans removes that
+    coupling entirely, and is what dialogue-gated levelling means in practice.
+    """
+    spans = sorted(((float(cue["end"]) - float(cue["start"]), float(cue["start"]), float(cue["end"]))
+                    for cue in cues
+                    if float(cue.get("end", 0)) - float(cue.get("start", 0)) >= .6),
+                   reverse=True)
+    if not spans:
+        return None
+    selected, total = [], 0.0
+    for length, start, end in spans:
+        if len(selected) >= 80 or total >= 300:
+            break
+        selected.append((start, end)); total += length
+    if not selected:
+        return None
+    selected.sort()
+    expression = "+".join(f"between(t,{start:.3f},{end:.3f})" for start, end in selected)
+    result = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", str(premaster), "-af",
+         f"aselect='{expression}',asetpts=N/SR/TB,"
+         "loudnorm=I=-24:TP=-2:LRA=18:print_format=json", "-f", "null", os.devnull],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    matches = __import__('re').findall(r"\{[^{}]+\}", result.stderr, flags=__import__('re').S)
+    if not matches:
+        return None
+    try:
+        return float(json.loads(matches[-1]).get("input_i"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def master_audio(premaster: Path, output: Path, dialogue: Path, preset: str,
+                 cues: list[dict] | None = None) -> dict:
     """Apply an explicit delivery preset rather than merely reporting loudness."""
     if preset == "preserve":
         shutil.copyfile(premaster, output)
@@ -1523,11 +2343,17 @@ def master_audio(premaster: Path, output: Path, dialogue: Path, preset: str) -> 
     else:
         # Cinema/localization preset: set program gain from dialogue-gated content,
         # then protect the full program at -2 dBTP.
-        dialogue_lufs = measured_lufs(dialogue)
+        gated = dialogue_gated_lufs(premaster, cues) if cues else None
+        stem_lufs = measured_lufs(dialogue)
+        # The gated measurement is the correct basis; the stem is only a fallback
+        # for an audio-only or cue-less job, and is recorded for comparison.
+        dialogue_lufs = gated if gated is not None else stem_lufs
         gain = float(__import__('numpy').clip(-27.0 - (dialogue_lufs if dialogue_lufs is not None else -27.0), -12, 12))
         audio_filter = f"volume={gain:.3f}dB,alimiter=limit=0.794"
         result = {"preset": "cinema dialogue-gated", "target_dialogue_lufs": -27.0,
                   "measured_dialogue_lufs": dialogue_lufs,
+                  "measurement_basis": "dialogue-gated mix" if gated is not None else "dialogue stem",
+                  "dialogue_stem_lufs": stem_lufs,
                   "dialogue_lufs_after_gain": round((dialogue_lufs or -27.0) + gain, 2),
                   "program_gain_db": round(gain, 3), "true_peak_target_dbtp": -2.0}
     run("ffmpeg", "-y", "-v", "error", "-i", str(premaster), "-af", audio_filter,

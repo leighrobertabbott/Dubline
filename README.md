@@ -4,7 +4,7 @@
 
 **Fully Local, Unattended Cinematic Film-Dubbing Pipeline with Automatic Stem Separation, ASR, LLM Adaptation, Voice Cloning, and Cinema Mastering.**
 
-*No cloud inference · No hosted APIs · 100% On-Device*
+*No cloud inference · media processing stays on-device · optional title-only catalogue lookup*
 
 </div>
 
@@ -35,11 +35,12 @@ Drop in any video file (with optional sidecar subtitles), select your workflow p
 - **Strict Process & VRAM Isolation:** Designed to run reliably on consumer GPUs (8 GB+ VRAM). Every heavy AI model (Bandit, RoFormer, pyannote, Qwen ASR, LLM, IndexTTS) executes in its own isolated subprocess where process exit guarantees clean CUDA memory release.
 - **Cinematic Stem Separation:** Uses Bandit v2 for multilingual music, effects, and speech separation, with MelBand-RoFormer and HTDemucs vocal recovery gating.
 - **Audiovisual Speaker Tracking:** Fuses whole-film `pyannote.audio` diarization and CAMPPlus voiceprints with OpenCV YuNet & SFace visual active-mouth tracking for accurate character identity assignment.
-- **Syllable- & Timing-Aware Dialogue Adaptation:** Hy-MT2 7B LLM generates multiple dubbing candidates scored by semantic adequacy, syllable count, natural pauses, and viseme compatibility.
+- **Measured Dialogue Adaptation:** Hy-MT2 7B generates meaning-preserving candidates, while real synthesized speech duration—not character, syllable, or invented viseme counts—controls retries and final selection.
 - **Independent Bilingual QC Judge:** Translations are audited by an independent Qwen 8B bilingual judge to catch hallucinated facts, omissions, or tone shifts before synthesis.
 - **Prosody & Emotion-Matched TTS:** Synthesizes speech with IndexTTS 2.5 using source cue audio as performance/emotion prompts, with automatic Qwen3-TTS fallback.
 - **Non-Verbal Sound Preservation:** Retains natural human expressions (laughter, gasps, crying, grunts, sighs) by selectively removing only forced-aligned spoken word spans from the original performance track.
 - **Cinema Mastering & Spatial Matching:** Applies 6-band dynamic Match EQ, early-reflection convolution matching, dialogue-gated loudness normalization (Cinema −27 LUFS, EBU R128 −23 LUFS, or Web −16 LUFS), and true-peak limiting.
+- **Film & TV Project Library:** Parses scene/P2P/disc filenames, Kodi-style IDs and NFO files; conservatively matches film/TV catalogues; caches covers locally; and groups every full dub, range encode and retry beneath one collapsible project.
 
 ---
 
@@ -50,6 +51,7 @@ Drop in any video file (with optional sidecar subtitles), select your workflow p
 - **Drag & Drop:** Drop consumer or professional media files directly into the UI.
   - *Supported Containers:* `mkv`, `mp4`, `mov`, `avi`, `webm`, `ts`, `m2ts`, `mxf`, `wav`, `flac`, `mp3`, `m4a`, `ogg`.
 - **Subtitles:** Drop optional sidecar subtitle files (`.srt`, `.vtt`, `.sub`/`.idx`). If omitted, the pipeline runs automatic speech recognition (Qwen3-ASR & Whisper) and forced alignment.
+- **Project identity and covers:** Local `<filename>.nfo`, `<filename>-poster.jpg`, `poster.jpg` and `folder.jpg` files take priority. With automatic matching enabled, Dubline sends only the cleaned title/year/episode identifier—not the media path, video or voices—and caches the selected artwork under the local work directory.
 
 ### 2. Time-Range Selection (Diagnostic / Scene Dubbing)
 - **Full Film:** Leave start/end empty to process the complete runtime.
@@ -116,7 +118,7 @@ Select the target loudness standard for the delivered English audio track:
 
 ## System Requirements
 
-- **Operating System:** Windows 10/11 (64-bit) or Linux
+- **Operating System:** Windows 10/11 (64-bit) or x86-64 Linux. macOS is detected and explained, but the current CUDA pipeline cannot run on modern Metal-only Macs.
 - **GPU:** NVIDIA GPU with CUDA support (8 GB VRAM minimum; 12 GB+ recommended)
 - **CPU:** 6+ cores / 12+ threads recommended
 - **RAM:** 16 GB minimum (32 GB recommended)
@@ -127,9 +129,21 @@ Select the target loudness standard for the delivered English audio track:
 
 ## Quick Start
 
-### 1. Installation
+### Windows: one click
 
-Clone the repository and run the automated setup script to configure virtual environments and download required models:
+Download and extract the GitHub ZIP, then double-click **`Install Dubline.cmd`**. It prepares the isolated runtime and opens the first-run wizard; the wizard checks the GPU and storage, accepts an optional Hugging Face token, downloads every selected model with resume support, and verifies the installation. Later, use **`Start Dubline.cmd`**.
+
+### Linux: one command
+
+After extracting or cloning the repository, run:
+
+```sh
+chmod +x start-dubline.sh && ./start-dubline.sh
+```
+
+The launcher bootstraps the isolated runtime when it is missing, then opens the same browser-based setup wizard. A current NVIDIA driver and CUDA-capable GPU are required.
+
+### Manual Windows setup (developers)
 
 ```powershell
 # Clone the repository
@@ -140,7 +154,7 @@ cd Dubline
 .\setup.ps1
 ```
 
-### 2. Launch the Application
+### Launch the Application
 
 Start the local server and web interface:
 
@@ -161,10 +175,20 @@ Dubline can be configured via environment variables or by creating a `.env` file
 | `DUB_ENGINE` | `indextts` | Primary TTS engine (`indextts` or `qwen-tts`) |
 | `DUB_WORKDIR` | `./data` | Working directory for job stems and temporary files |
 | `DUB_DIARIZATION_DEVICE` | `cuda` | Hardware device for diarization (`cuda` or `cpu`) |
-| `DUB_LLAMA_GPU_LAYERS` | `-1` | Number of GPU layers for LLM adaptation (`-1` = full offload) |
+| `DUB_LLAMA_GPU_LAYERS` | `24` | CUDA-heavy partial offload for laptop-safe LLM adaptation (`-1` = full offload) |
+| `DUB_GPU_ABORT_TEMPERATURE_C` | `90` | Last-resort stop above this laptop GPU's locally reported 87°C firmware target |
+| `DUB_GPU_WATCHDOG_SECONDS` | `0.5` | Interval for active NVIDIA health monitoring during every CUDA stage |
+| `DUB_GPU_SOFT_TEMPERATURE_C` | `72` | Begin yielding between synthesized lines before the hard watchdog is reached |
+| `DUB_GPU_COOLDOWN_TARGET_C` | `69` | Resume line generation after proactive cooling reaches this target |
+| `DUB_GPU_LINE_COOLDOWN_SECONDS` | `1.0` | Minimum idle handoff between synthesized dialogue lines |
+| `INDEXTTS_DIFFUSION_STEPS` | `16` | Thermal-safe IndexTTS 2.5 flow refinement on this laptop (`25` restores upstream maximum) |
+| `DUB_GPU_AUTO_RESUME_LIMIT` | `12` | Maximum automatic thermal resumptions before leaving a job paused for review |
+| `DUB_GPU_AUTO_RESUME_TIMEOUT_SECONDS` | `600` | How long to wait for a cool, idle, released GPU before requiring manual resume |
 | `BANDIT_CHECKPOINT` | `./vendor/...` | Path to Bandit v2 separation checkpoint |
 | `MUSETALK_ENABLED` | `0` | Enable optional generative visual lip-sync pass (`0` or `1`) |
 | `HF_TOKEN` | *None* | Optional Hugging Face token for gated models (e.g. pyannote) |
+| `MEDIA_LOOKUP_ENABLED` | `1` | Use local metadata/artwork first, then optional title-only catalogue matching |
+| `DUBLINE_TMDB_TOKEN` | release managed | Application catalogue credential injected by official builds; ordinary users do not need to provide it |
 
 ---
 
