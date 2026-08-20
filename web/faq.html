@@ -3,18 +3,18 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#0d0e10">
+  <meta name="theme-color" content="#0a0a0c">
   <meta name="description" content="Plain-language help for creating, reviewing and delivering an English film dub with Dubline.">
   <title>Help &amp; FAQ · Dubline</title>
-  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/faq.css">
 </head>
 <body class="faq-body">
   <div class="faq-shell">
     <header class="topbar faq-topbar">
-      <a class="brand" href="/" aria-label="Dubline projects"><span class="brand-mark">D</span><span>dubline</span></a>
-      <span class="help-label">Help centre</span>
-      <a class="return-link" href="/">Back to projects <span>→</span></a>
+      <a class="brand" href="/" aria-label="Dubline projects"><span class="brand-mark">D</span><span>Dubline</span></a>
+      <span class="help-label">Help</span>
+      <a class="return-link" href="/">Back to projects</a>
     </header>
 
     <aside class="faq-rail" aria-label="FAQ sections">
@@ -27,40 +27,30 @@
         <button data-category="delivery"><span>Files &amp; delivery</span><b>4</b></button>
         <button data-category="limits"><span>Limits &amp; privacy</span><b>5</b></button>
       </nav>
-      <div class="fact-card">
-        <span>THE SHORT VERSION</span>
-        <strong>Your media stays here.</strong>
-        <p>After setup, the dubbing models run on this Windows PC. Dubline does not upload your film or voices to a hosted inference service.</p>
-      </div>
     </aside>
 
     <main class="faq-main">
       <section class="faq-hero">
-        <p class="kicker">DUBLINE USER GUIDE</p>
-        <h1>Good questions.<br><em>Straight answers.</em></h1>
-        <p class="hero-copy">Everything you need to start a dub, understand what happens while it runs, and decide when an English master is ready to release.</p>
+        <h1>Help</h1>
+        <p class="hero-copy">How to start a dub, what happens while it runs, and how to tell when an English master is ready to release.</p>
         <label class="faq-search">
-          <span aria-hidden="true">⌕</span>
           <span class="sr-only">Search frequently asked questions</span>
-          <input id="faqSearch" type="search" placeholder="Search questions — try “subtitles” or “pause”" autocomplete="off">
+          <input class="input" id="faqSearch" type="search" placeholder="Search questions" autocomplete="off">
           <kbd>/</kbd>
         </label>
       </section>
 
       <section class="answer-first" aria-labelledby="what-is-dubline">
-        <div class="answer-number">01</div>
         <div>
-          <p class="kicker">START HERE</p>
           <h2 id="what-is-dubline">What is Dubline?</h2>
           <p>Dubline turns a local film or audio programme into an English-language dub. It finds the dialogue, separates it from music and effects, works out who is speaking, translates and performs each line, fits those lines to the original timing, then adds a new English track to an MKV.</p>
           <p>It is designed for an unattended full-film run. If a line or delivery check cannot be resolved automatically, the film is still produced when possible and is clearly marked <strong>Needs review</strong>.</p>
         </div>
-        <a class="primary" href="/">Start a dub <b>→</b></a>
+        <a class="btn-primary" href="/">Start a dub</a>
       </section>
 
       <section class="quick-start" aria-labelledby="quick-start-title">
         <div class="section-heading">
-          <p class="kicker">THREE STEPS</p>
           <h2 id="quick-start-title">The quickest way through</h2>
         </div>
         <div class="quick-grid">
@@ -72,7 +62,7 @@
 
       <section class="faq-list-section" aria-labelledby="questions-title">
         <div class="section-heading question-heading">
-          <div><p class="kicker">COMMON QUESTIONS</p><h2 id="questions-title">All the practical details</h2></div>
+          <div><h2 id="questions-title">All questions</h2></div>
           <p id="resultCount" aria-live="polite">Showing 24 questions</p>
         </div>
 
@@ -194,21 +184,21 @@
           </section>
 
           <div class="empty-state hidden" id="emptyState">
-            <span>⌕</span><h3>No exact match</h3><p>Try a shorter phrase such as “subtitle”, “track”, “pause”, “quality” or “privacy”.</p><button id="clearSearch" class="secondary">Clear search</button>
+            <h3>No match</h3><p>Try a shorter phrase: subtitle, track, pause, quality, privacy.</p><button type="button" id="clearSearch" class="btn-secondary">Clear search</button>
           </div>
         </div>
       </section>
 
       <section class="boundary-card" aria-labelledby="boundary-title">
-        <div><p class="kicker">IMPORTANT BOUNDARY</p><h2 id="boundary-title">A careful assistant, not a replacement for final human judgement.</h2></div>
+        <div><p class="eyebrow">WHAT THIS IS NOT</p><h2 id="boundary-title">A careful assistant, not a substitute for a final human listen.</h2></div>
         <p>Dubline is built to fail visibly when evidence is weak. A green result means the automated checks passed; a yellow result means the dub exists but needs attention. Neither status transfers rights, guarantees a perfect actor match, or replaces a full listen before release.</p>
       </section>
     </main>
 
     <footer class="faq-footer">
-      <a class="brand" href="/"><span class="brand-mark">D</span><span>dubline</span></a>
+      <a class="brand" href="/"><span class="brand-mark">D</span><span>Dubline</span></a>
       <p>Local film dubbing · English delivery · Evidence-led QC</p>
-      <a href="/">Return to projects →</a>
+      <a href="/">Back to projects</a>
     </footer>
   </div>
   <script src="/static/faq.js"></script>

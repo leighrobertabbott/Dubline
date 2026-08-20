@@ -3,132 +3,434 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta name="theme-color" content="#0d0e10">
-  <title>Dubline · Local AI video dubbing</title>
-  <link rel="stylesheet" href="/static/styles.css">
-  <link rel="stylesheet" href="/static/flow.css">
-  <link rel="stylesheet" href="/static/emotion.css">
-  <link rel="stylesheet" href="/static/qc.css">
-  <style>.topnav{margin-left:28px}.topnav a{color:var(--muted);text-decoration:none;font-size:11px;font-weight:700}.topnav a:hover{color:var(--ink)}@media(max-width:520px){.topnav{margin-left:16px}.topnav a{font-size:10px}}</style>
+  <meta name="theme-color" content="#0a0a0c">
+  <title>Dubline</title>
+  <link rel="stylesheet" href="/static/tokens.css">
+  <link rel="stylesheet" href="/static/app.css">
+  <link rel="stylesheet" href="/static/setup.css">
 </head>
 <body>
   <div class="app-shell">
-    <header class="topbar">
-      <a class="brand" href="#" aria-label="Dubline home"><span class="brand-mark">D</span><span>dubline</span></a>
-      <nav class="topnav" aria-label="Help"><a href="/faq">Help &amp; FAQ</a></nav>
-      <div class="system-state" id="systemState"><i></i><span>Checking local engine…</span></div>
-      <button class="icon-button mobile-jobs" id="mobileJobs" aria-label="Open projects">☰</button>
+    <header class="topbar app-topbar">
+      <a class="brand" href="#" aria-label="Dubline"><span class="brand-mark">D</span><span>Dubline</span></a>
+      <nav class="topnav" aria-label="Main">
+        <button id="setupButton" type="button">Setup</button>
+        <a href="/faq">Help</a>
+      </nav>
+      <div class="engine-state" id="systemState"><i></i><span>Checking engine</span></div>
+      <button class="rail-toggle" id="mobileJobs" type="button" aria-label="Show projects">&#9776;</button>
     </header>
 
     <aside class="rail" id="rail">
-      <div class="rail-heading"><span>Projects</span><button class="new-button" id="newJob" title="New project">＋</button></div>
-      <div class="job-list" id="jobList"><div class="list-empty">No projects yet</div></div>
-      <div class="local-note"><span class="lock">⌾</span><div><strong>Private by design</strong><small>Video and voices stay on this machine.</small></div></div>
+      <div class="rail-head">
+        <h2>Projects</h2>
+        <button class="new-project" id="newJob" type="button">New dub</button>
+      </div>
+      <div class="project-list" id="jobList">
+        <div class="list-empty">No projects yet</div>
+      </div>
+      <p class="rail-foot">Media, voices and rendering stay on this machine.</p>
     </aside>
 
     <main class="workspace">
-      <section id="createView" class="view create-view">
-        <div class="intro">
-          <p class="kicker">FULL-FILM ENGLISH DUBBING · ON THIS PC</p>
-          <h1>Drop in a film.<br><span>Get back the English dub.</span></h1>
-          <p>No pipeline setup. Dubline finds the best dialogue source, separates voices from music and effects, identifies recurring speakers, translates every scene, recreates each performance and returns one precisely timed MKV.</p>
-          <div class="absolute-strip" aria-label="Fixed delivery settings">
-            <span><i>EN</i> English output</span>
-            <span><i>MKV</i> Original picture and tracks preserved</span>
-            <span><i>GPU</i> Fully local CUDA processing</span>
-          </div>
+
+      <!-- ================= Compose ================= -->
+      <section id="createView" class="view">
+        <div class="view-head">
+          <h1>New dub</h1>
+          <p>English dialogue timed to the original picture, delivered as an MKV beside the untouched source tracks.</p>
         </div>
 
-        <div class="source-card">
-          <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Choose a complete film and optional subtitle files">
+        <div class="compose">
+          <div class="dropzone" id="dropzone" tabindex="0" role="button" aria-label="Choose a film or audio programme">
             <input id="files" type="file" multiple accept="video/*,audio/*,.mkv,.mp4,.mov,.avi,.webm,.m4v,.ts,.mts,.m2ts,.mpeg,.mpg,.wmv,.mxf,.vob,.3gp,.wav,.flac,.mp3,.m4a,.aac,.ogg,.opus,.wma,.srt,.ass,.ssa,.vtt,.sub,.idx">
-            <div class="drop-art"><span>↓</span><i></i><i></i></div>
-            <div><h2>Drop your film or audio programme here</h2><p>Consumer and professional media containers · add an .srt, .sub or .idx in the same drop only when you have one</p></div>
-            <button class="secondary" id="chooseFiles">Choose a film</button>
-          </div>
-          <div id="selection" class="selection hidden"></div>
-          <div class="range-card" aria-label="Film section">
-            <div><strong>Film section</strong><span id="sourceDuration">Leave both times blank to dub the complete film.</span></div>
-            <label><span>Start</span><input id="rangeStart" inputmode="numeric" placeholder="00:00:00" aria-label="Section start time"></label>
-            <span class="range-arrow">→</span>
-            <label><span>End</span><input id="rangeEnd" inputmode="numeric" placeholder="End of film" aria-label="Section end time"></label>
-            <button class="ghost" id="fullRange" type="button">Full film</button>
-          </div>
-          <div class="track-card hidden" id="audioTrackRow"><label><span>Working soundtrack</span><select id="audioTrack"></select></label><label class="hidden" id="subtitleTrackLabel"><span>Dialogue subtitles</span><select id="subtitleTrack"></select></label><small>Choose the full programme tracks, not commentary, forced signs, or audio description.</small></div>
-          <details class="release-controls">
-            <summary>Review and pronunciation controls</summary>
-            <div class="control-grid">
-              <label class="check-control"><input id="approvalWorkflow" type="checkbox"><span>Pause for transcript and translation review before generating voices</span></label>
-              <label><span>Pronunciation glossary</span><textarea id="glossary" rows="3" placeholder="Sato = Sah-toh&#10;NGINX = engine-ex"></textarea></label>
-              <label class="check-control required"><input id="voiceRights" type="checkbox"><span>I confirm I have the necessary rights and permission to dub this media and reproduce its voices.</span></label>
+            <div>
+              <h2>Drop a film here</h2>
+              <p>Any common video or audio container. Add a subtitle file to the same drop to use it as the dialogue source.</p>
             </div>
-          </details>
-          <div class="automatic-plan" aria-label="Automatic processing plan">
-            <div><span>01</span><strong>Understand</strong><small>language, subtitles, scenes and speakers</small></div>
-            <i>→</i>
-            <div><span>02</span><strong>Perform</strong><small>translation, voice and emotion</small></div>
-            <i>→</i>
-            <div><span>03</span><strong>Deliver</strong><small>cinema mix, exact timeline and QC</small></div>
+            <button class="btn-secondary" id="chooseFiles" type="button">Browse</button>
           </div>
-          <div class="start-row">
-            <p><span>✓</span> One automatic pass · safe to leave unattended</p>
-            <button class="primary" id="startDub" disabled>Dub the complete film <b>→</b></button>
+
+          <div class="compose-rows">
+            <div id="selection" class="selection hidden"></div>
+
+            <div class="compose-row hidden" id="audioTrackRow">
+              <div class="row-label">
+                <strong>Tracks</strong>
+                <span>Pick the full programme audio, not commentary or description.</span>
+              </div>
+              <div class="row-fields">
+                <div class="track-fields">
+                  <label>
+                    <span class="field-label">Audio</span>
+                    <select class="select" id="audioTrack"></select>
+                  </label>
+                  <label class="hidden" id="subtitleTrackLabel">
+                    <span class="field-label">Subtitles</span>
+                    <select class="select" id="subtitleTrack"></select>
+                  </label>
+                </div>
+              </div>
+            </div>
+
+            <div class="compose-row">
+              <div class="row-label">
+                <strong>Section</strong>
+                <span id="sourceDuration">Leave blank to dub the whole film.</span>
+              </div>
+              <div class="row-fields">
+                <div class="field-inline">
+                  <input class="input input-mono" id="rangeStart" inputmode="numeric" placeholder="00:00:00" aria-label="Section start">
+                  <span class="sep">to</span>
+                  <input class="input input-mono" id="rangeEnd" inputmode="numeric" placeholder="End" aria-label="Section end">
+                  <button class="btn-ghost btn-sm" id="fullRange" type="button">Whole film</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="compose-row">
+              <div class="row-label">
+                <strong>Review</strong>
+                <span>Stop after translation so you can correct lines.</span>
+              </div>
+              <div class="row-fields">
+                <label class="checkbox-row">
+                  <input id="approvalWorkflow" type="checkbox">
+                  <span>
+                    <strong>Hold before voicing</strong>
+                    <small>Transcript and translation wait for your approval. Off by default: the run completes unattended.</small>
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            <div class="compose-row">
+              <div class="row-label">
+                <strong>Pronunciation</strong>
+                <span>One name per line. Optional.</span>
+              </div>
+              <div class="row-fields">
+                <textarea class="textarea input-mono" id="glossary" rows="3" placeholder="Sato = Sah-toh&#10;NGINX = engine-ex" aria-label="Pronunciation glossary"></textarea>
+              </div>
+            </div>
           </div>
-          <details class="local-source">
-            <summary>Very large film? Use its path without making a second copy</summary>
-            <div><textarea id="localPath" rows="2" placeholder="C:\Films\feature-film.mkv&#10;C:\Films\second-film.mxf" aria-label="Full local film path"></textarea><button id="probeLocal" class="ghost">Check first</button><button id="startLocal" class="secondary">Dub file(s)</button></div>
-          </details>
+
+          <div class="compose-foot">
+            <label class="checkbox-row" for="voiceRights">
+              <input id="voiceRights" type="checkbox">
+              <span>
+                <strong>I hold the rights to dub this media and reproduce its voices.</strong>
+                <small>Required before any voice is generated.</small>
+              </span>
+            </label>
+            <div class="start-action">
+              <button class="btn-primary btn-lg" id="startDub" type="button" disabled>Start dub</button>
+              <span class="start-note" id="startNote">Choose a film to begin.</span>
+            </div>
+          </div>
         </div>
 
-        <div class="feature-strip">
-          <article><span>FULL LENGTH</span><h3>Built for feature films</h3><p>Restart-safe stages and bounded model memory handle long timelines.</p></article>
-          <article><span>AUTOMATIC</span><h3>Only exceptions surface</h3><p>Failed takes retry themselves; unresolved lines remain in the QC report.</p></article>
-          <article><span>PRIVATE</span><h3>Nothing leaves this PC</h3><p>Models, video, voices and final rendering remain local.</p></article>
-        </div>
+        <details class="local-source">
+          <summary>Reference a file in place instead of copying it</summary>
+          <div class="local-source-body">
+            <textarea class="textarea input-mono" id="localPath" rows="2" placeholder="C:\Films\feature.mkv&#10;C:\Films\second.mxf" aria-label="Local file paths"></textarea>
+            <div class="local-source-actions">
+              <button class="btn-ghost" id="probeLocal" type="button">Inspect</button>
+              <button class="btn-secondary" id="startLocal" type="button">Start dub</button>
+            </div>
+          </div>
+        </details>
       </section>
 
-      <section id="jobView" class="view job-view hidden">
-        <div class="job-topline">
-          <button class="back-button" id="backButton">← Projects</button>
-          <div class="job-actions"><button class="ghost" id="pauseButton">Pause</button><button class="ghost danger" id="cancelButton">Cancel</button></div>
+      <!-- ================= Job ================= -->
+      <section id="jobView" class="view view-job hidden">
+        <div class="job-bar">
+          <button class="back-button" id="backButton" type="button">&#8592; Projects</button>
+          <div class="job-actions">
+            <button class="btn-ghost btn-sm" id="pauseButton" type="button">Pause</button>
+            <button class="btn-ghost btn-sm btn-danger" id="cancelButton" type="button">Cancel</button>
+          </div>
         </div>
-        <div class="job-hero">
-          <div><p class="kicker" id="jobStatus">IN PROGRESS</p><h1 id="jobTitle">Video title</h1><p id="jobMeta">Preparing media</p></div>
-          <div class="ring" id="progressRing"><strong id="jobPercent">0%</strong><span>complete</span></div>
+
+        <div class="job-head">
+          <div class="hero-poster" id="heroPoster">
+            <img id="jobPoster" alt="" class="hidden">
+            <span id="jobPosterFallback">D</span>
+          </div>
+          <div class="job-head-copy">
+            <span class="chip" id="jobStatus">Queued</span>
+            <h1 id="jobTitle">Untitled</h1>
+            <p class="job-identity-line" id="jobIdentityLine">Film</p>
+            <p class="job-meta" id="jobMeta">Preparing media</p>
+            <button class="identity-button" id="identifyButton" type="button">Find title and cover</button>
+          </div>
+          <div class="job-readout" id="progressRing">
+            <strong class="ring-value" id="jobPercent">0%</strong>
+            <span class="ring-label">complete</span>
+          </div>
         </div>
+
         <div class="progress-card">
-          <div class="stage-line"><div><span class="pulse"></span><strong id="jobStage">Waiting for GPU worker</strong></div><span id="etaLabel">Timeline protected</span></div>
-          <div class="progress-track"><i id="progressBar"></i></div>
+          <div class="stage-line">
+            <div><span class="dot dot-live"></span><strong id="jobStage">Queued</strong></div>
+            <span class="eta-label" id="etaLabel">Waiting to start</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-label="Dub progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="progressTrack">
+            <i id="progressBar"></i>
+          </div>
           <div class="pipeline-steps" id="pipelineSteps">
-            <span data-at="2">Inspect</span><span data-at="7">Separate</span><span data-at="26">Understand</span><span data-at="35">Voice</span><span data-at="83">Timeline</span><span data-at="95">Video</span>
+            <span data-at="2">Inspect</span>
+            <span data-at="7">Separate</span>
+            <span data-at="26">Understand</span>
+            <span data-at="35">Voice</span>
+            <span data-at="83">Timeline</span>
+            <span data-at="95">Render</span>
           </div>
         </div>
 
         <div class="metrics" id="metrics">
-          <article><span>Dialogue source</span><strong id="cueSource">Detecting…</strong></article>
-          <article><span>Voice lines</span><strong id="lineCount">—</strong></article>
-          <article><span>Runtime</span><strong id="runtime">—</strong></article>
-          <article><span>Frame</span><strong id="dimensions">—</strong></article>
+          <article><span>Dialogue source</span><strong class="metric-value" id="cueSource">Detecting</strong></article>
+          <article><span>Lines</span><strong class="metric-value" id="lineCount">&mdash;</strong></article>
+          <article><span>Runtime</span><strong class="metric-value" id="runtime">&mdash;</strong></article>
+          <article><span>Frame</span><strong class="metric-value" id="dimensions">&mdash;</strong></article>
         </div>
 
-        <div class="result-banner hidden" id="resultBanner">
-          <div class="result-icon" id="resultIcon">✓</div><div><p id="resultLabel">ENGLISH DUB READY</p><h2 id="resultTitle">Automatic checks complete.</h2><span id="outputSize"></span></div>
-          <a class="secondary" id="qcButton">QC report</a><a class="primary" id="downloadButton">Download .mkv <b>↓</b></a>
-          <details class="export-menu"><summary>More exports</summary><div><a id="srtExport">SRT</a><a id="csvExport">CSV</a><a id="edlExport">EDL</a><a id="clipsExport">Audio package</a><a id="mixExport">Mix FLAC</a><a id="dialogueExport">Dialogue FLAC</a></div></details>
+        <div class="banner result-banner hidden" id="resultBanner">
+          <div class="banner-copy">
+            <p class="eyebrow" id="resultLabel">DUB READY</p>
+            <h2 id="resultTitle">Every automatic check passed.</h2>
+            <p id="outputSize"></p>
+          </div>
+          <div class="banner-actions">
+            <details class="export-menu">
+              <summary>Exports</summary>
+              <div>
+                <a id="qcButton">QC report</a>
+                <a id="srtExport">Subtitles (SRT)</a>
+                <a id="csvExport">Cue sheet (CSV)</a>
+                <a id="edlExport">Edit list (EDL)</a>
+                <a id="clipsExport">Audio package</a>
+                <a id="mixExport">Full mix (FLAC)</a>
+                <a id="dialogueExport">Dialogue stem (FLAC)</a>
+              </div>
+            </details>
+            <a class="btn-primary" id="downloadButton">Download MKV</a>
+          </div>
         </div>
-        <div class="error-banner hidden" id="errorBanner"><strong>Processing stopped</strong><span id="errorText"></span><button class="secondary" id="resumeButton">Retry from checkpoint</button></div>
-        <div class="approval-banner hidden" id="approvalBanner"><div><strong id="approvalTitle">Transcript and translation ready</strong><span id="approvalText">Review or edit the lines below. Voice generation will not start until you continue.</span><div class="job-track-pickers hidden" id="jobTrackPickers"><label>Programme audio<select id="jobAudioTrack"></select></label><label>Dialogue subtitles<select id="jobSubtitleTrack"></select></label></div></div><button class="primary" id="approveButton">Continue to voices →</button></div>
+
+        <div class="banner error-banner hidden" id="errorBanner">
+          <div class="banner-copy">
+            <p class="eyebrow">STOPPED</p>
+            <h2>Processing stopped</h2>
+            <p id="errorText"></p>
+          </div>
+          <div class="banner-actions">
+            <button class="btn-secondary" id="resumeButton" type="button">Resume from checkpoint</button>
+          </div>
+        </div>
+
+        <div class="banner approval-banner hidden" id="approvalBanner">
+          <div class="banner-copy">
+            <p class="eyebrow">WAITING FOR YOU</p>
+            <h2 id="approvalTitle">Translation ready</h2>
+            <p id="approvalText">Correct any line below. Voicing starts when you continue.</p>
+            <div class="job-track-pickers hidden" id="jobTrackPickers">
+              <label>
+                <span class="field-label">Programme audio</span>
+                <select class="select" id="jobAudioTrack"></select>
+              </label>
+              <label>
+                <span class="field-label">Dialogue subtitles</span>
+                <select class="select" id="jobSubtitleTrack"></select>
+              </label>
+            </div>
+          </div>
+          <div class="banner-actions">
+            <button class="btn-primary" id="approveButton" type="button">Continue</button>
+          </div>
+        </div>
 
         <section class="cue-panel">
-          <div class="panel-heading"><div><p class="kicker">VOICE TIMELINE</p><h2>English lines</h2></div><div class="legend"><i></i> Precisely fitted</div></div>
-          <div class="cue-head"><span>TIME</span><span>DIALOGUE</span><span>VOICE</span><span>STATE</span></div>
-          <div id="cueList" class="cue-list"><div class="cue-empty">Lines will appear after dialogue analysis.</div></div>
+          <div class="cue-toolbar">
+            <h2>Lines <span class="cue-count" id="cueCount"></span></h2>
+            <input class="input cue-search" id="cueSearch" type="search" placeholder="Search dialogue" aria-label="Search dialogue">
+            <div class="cue-filters" id="cueFilters" role="group" aria-label="Filter lines">
+              <button type="button" class="active" data-filter="all">All</button>
+              <button type="button" data-filter="review">Needs review</button>
+              <button type="button" data-filter="done">Passed</button>
+            </div>
+          </div>
+          <div class="cue-head">
+            <span>Time</span><span>Dialogue</span><span>Voice</span><span>State</span>
+          </div>
+          <div id="cueList" class="cue-list">
+            <div class="cue-empty">Lines appear once dialogue analysis finishes.</div>
+          </div>
         </section>
-        <details class="activity"><summary>Processing notes</summary><div id="logList"></div></details>
+
+        <details class="activity">
+          <summary>Processing notes</summary>
+          <div id="logList"></div>
+        </details>
       </section>
     </main>
   </div>
-  <div class="toast hidden" id="toast"></div>
+
+  <!-- ================= Setup ================= -->
+  <div class="setup-wizard hidden" id="setupWizard" role="dialog" aria-modal="true" aria-labelledby="setupTitle">
+    <div class="setup-card">
+      <aside class="setup-side">
+        <a class="brand setup-brand" href="#" aria-label="Dubline"><span class="brand-mark">D</span><span>Dubline</span></a>
+        <ol class="setup-steps" aria-label="Setup progress">
+          <li data-setup-step="check"><b>1</b><span><strong>Check</strong><small>System and storage</small></span></li>
+          <li data-setup-step="access"><b>2</b><span><strong>Extras</strong><small>Speakers and artwork</small></span></li>
+          <li data-setup-step="install"><b>3</b><span><strong>Install</strong><small>Download and verify</small></span></li>
+        </ol>
+        <p class="setup-privacy">Tokens are stored in this Dubline folder and never written to project logs.</p>
+      </aside>
+
+      <section class="setup-main">
+        <button class="setup-close hidden" id="setupClose" type="button" aria-label="Close setup">&times;</button>
+
+        <div class="setup-panel" id="setupCheckPanel">
+          <p class="eyebrow eyebrow-accent">STEP 1 OF 3</p>
+          <h1 id="setupTitle">Check this computer</h1>
+          <p class="setup-lead">Dubline needs an NVIDIA GPU and room for the models. Nothing downloads until you approve it.</p>
+          <div class="setup-system-grid" id="setupSystemGrid" aria-live="polite">
+            <article class="checking"><i></i><span>Operating system</span><strong>Checking</strong><small>Windows or Linux</small></article>
+            <article class="checking"><i></i><span>Graphics</span><strong>Checking</strong><small>NVIDIA CUDA</small></article>
+            <article class="checking"><i></i><span>Storage</span><strong>Checking</strong><small>Models and tools</small></article>
+          </div>
+          <div class="setup-compatibility hidden" id="setupCompatibility"><strong>Cannot continue</strong><p></p></div>
+          <div class="setup-actions">
+            <span id="setupDownloadEstimate">Measuring download size</span>
+            <button class="btn-ghost hidden" id="setupRescan" type="button">Scan again</button>
+            <button class="btn-primary" id="setupToAccess" type="button" disabled>Continue</button>
+          </div>
+        </div>
+
+        <div class="setup-panel hidden" id="setupAccessPanel">
+          <button class="setup-back" id="setupBackToCheck" type="button">&#8592; Back</button>
+          <p class="eyebrow eyebrow-accent">STEP 2 OF 3</p>
+          <h1 id="setupAccessTitle" tabindex="-1">Optional extras</h1>
+          <p class="setup-lead">Artwork lookup needs no account. A free Hugging Face token improves speaker detection in crowded scenes.</p>
+
+          <div class="hf-card">
+            <div class="hf-heading">
+              <span class="hf-mark">HF</span>
+              <div><strong>Hugging Face</strong><small id="hfConnectionState">Not connected</small></div>
+              <button class="btn-ghost btn-sm hidden" id="hfForget" type="button">Disconnect</button>
+            </div>
+            <div class="hf-instructions" id="hfInstructions">
+              <ol>
+                <li><a href="https://huggingface.co/pyannote/speaker-diarization-community-1" target="_blank" rel="noreferrer">Accept the model conditions</a></li>
+                <li><a href="https://huggingface.co/settings/tokens/new?tokenType=read" target="_blank" rel="noreferrer">Create a read-only token</a></li>
+              </ol>
+              <label class="token-field">
+                <span>Token</span>
+                <div>
+                  <input id="hfToken" type="password" autocomplete="off" spellcheck="false" placeholder="hf_...">
+                  <button id="showToken" type="button" aria-label="Show token">Show</button>
+                </div>
+              </label>
+              <button class="btn-secondary" id="saveToken" type="button">Connect</button>
+            </div>
+          </div>
+
+          <label class="setup-choice">
+            <input id="enhancedSpeakers" type="checkbox" checked>
+            <span><strong>Enhanced speaker detection</strong><small>Recommended for features. Needs the token above.</small></span>
+          </label>
+          <label class="setup-choice">
+            <input id="selectiveLipSync" type="checkbox">
+            <span><strong>Selective lip sync</strong><small>About 17 GB. Applied only to suitable close-ups.</small></span>
+          </label>
+          <label class="setup-choice">
+            <input id="automaticArtwork" type="checkbox" checked>
+            <span><strong>Automatic titles and covers</strong><small>Local NFO and poster files first; otherwise the cleaned title and year are looked up.</small></span>
+          </label>
+
+          <details class="catalogue-advanced">
+            <summary>Developer catalogue override</summary>
+            <div class="hf-card media-access-card">
+              <div class="hf-heading">
+                <span class="hf-mark tmdb-mark">TMDB</span>
+                <div><strong>Catalogue access</strong><small id="tmdbConnectionState">Checking</small></div>
+                <button class="btn-ghost btn-sm hidden" id="tmdbForget" type="button">Remove</button>
+              </div>
+              <div class="hf-instructions" id="tmdbInstructions">
+                <p class="catalogue-explainer">Released builds include catalogue access. Paste a personal token only when running from a source checkout.</p>
+                <ol>
+                  <li><a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noreferrer">Open TMDB API settings</a></li>
+                  <li>Copy the API Read Access Token</li>
+                </ol>
+                <label class="token-field">
+                  <span>API Read Access Token</span>
+                  <div>
+                    <input id="tmdbToken" type="password" autocomplete="off" spellcheck="false" placeholder="eyJhbGciOiJI...">
+                    <button id="showTmdbToken" type="button" aria-label="Show token">Show</button>
+                  </div>
+                </label>
+                <button class="btn-secondary" id="saveTmdbToken" type="button">Save override</button>
+              </div>
+            </div>
+          </details>
+
+          <div class="setup-actions">
+            <span>Optional models can be changed later from Setup.</span>
+            <button class="btn-primary" id="beginSetup" type="button">Download and install</button>
+          </div>
+        </div>
+
+        <div class="setup-panel hidden" id="setupInstallPanel">
+          <p class="eyebrow eyebrow-accent" id="setupInstallKicker">STEP 3 OF 3</p>
+          <h1 id="setupInstallTitle">Installing</h1>
+          <p class="setup-lead" id="setupInstallDetail">Downloads resume where they stopped if the connection drops.</p>
+          <div class="setup-progress" id="setupProgress" role="progressbar" aria-label="Setup progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div>
+              <strong id="setupProgressLabel">Preparing</strong>
+              <span class="progress-percent" id="setupProgressPercent">0%</span>
+            </div>
+            <div class="setup-progress-track"><i id="setupProgressBar"></i></div>
+          </div>
+          <div class="setup-components" id="setupComponents"></div>
+          <div class="setup-error hidden" id="setupError" role="alert"><strong>Setup paused</strong><p></p></div>
+          <details class="setup-log hidden" id="setupLog"><summary>Details</summary><div></div></details>
+          <div class="setup-actions">
+            <button class="btn-ghost hidden" id="cancelSetup" type="button">Pause</button>
+            <span id="setupKeepOpen">You can leave this window open.</span>
+            <button class="btn-secondary hidden" id="retrySetup" type="button">Try again</button>
+            <button class="btn-primary hidden" id="finishSetup" type="button">Start dubbing</button>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- ================= Identity ================= -->
+  <div class="media-match hidden" id="mediaMatch" role="dialog" aria-modal="true" aria-labelledby="mediaMatchTitle">
+    <div class="media-match-card">
+      <button class="media-match-close" id="mediaMatchClose" type="button" aria-label="Close">&times;</button>
+      <h2 id="mediaMatchTitle">Find the right title</h2>
+      <p class="media-match-lead">Automatic matching is deliberately conservative. Search here when the filename was unusual.</p>
+      <div class="media-search">
+        <input class="input" id="mediaSearchQuery" type="search" maxlength="160" placeholder="Title" aria-label="Title">
+        <select class="select" id="mediaSearchType" aria-label="Type">
+          <option value="movie">Film</option>
+          <option value="tv">TV series</option>
+        </select>
+        <input class="input" id="mediaSearchYear" type="number" min="1888" max="2100" placeholder="Year" aria-label="Year">
+        <button class="btn-primary" id="mediaSearchButton" type="button">Search</button>
+      </div>
+      <div class="media-results" id="mediaResults">
+        <div class="media-results-empty">Enter a title to search.</div>
+      </div>
+      <p class="media-attribution">Metadata and images from TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB. TV results may also use TVmaze under CC BY-SA.</p>
+    </div>
+  </div>
+
+  <div class="toast hidden" id="toast" role="status" aria-live="polite"></div>
   <script src="/static/app.js"></script>
+  <script src="/static/setup.js"></script>
 </body>
 </html>
