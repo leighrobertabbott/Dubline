@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import os
 import zipfile
 from pathlib import Path
@@ -23,6 +24,13 @@ def system_state(value: bool = False) -> dict:
         "gpu": "Test NVIDIA GPU, 12288 MiB",
         "disk_free_gb": 999,
     }
+
+
+def plenty_of_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SetupManager measures the real drive, so a developer running low on space
+    would otherwise trip the disk guard before reaching the check under test."""
+    monkeypatch.setattr("app.services.setup_manager.shutil.disk_usage",
+                        lambda _: shutil._ntuple_diskusage(2000 * 1024 ** 3, 0, 2000 * 1024 ** 3))
 
 
 def supported_windows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -76,6 +84,7 @@ def test_hugging_face_token_is_masked_and_atomically_removable(tmp_path: Path,
 
 def test_gated_component_cannot_start_without_token(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     supported_windows(monkeypatch)
+    plenty_of_disk(monkeypatch)
     monkeypatch.delenv("HF_TOKEN", raising=False)
     monkeypatch.setattr("app.services.setup_manager.shutil.which", lambda _: None)
     manager = SetupManager(tmp_path, lambda: system_state(False))
@@ -96,6 +105,7 @@ def test_interrupted_setup_state_recovers_without_claiming_it_is_running(tmp_pat
 def test_already_complete_setup_finishes_without_starting_downloads(tmp_path: Path,
                                                                     monkeypatch: pytest.MonkeyPatch):
     supported_windows(monkeypatch)
+    plenty_of_disk(monkeypatch)
     manager = SetupManager(tmp_path, lambda: system_state(True))
     result = manager.start(include_diarization=False, include_lip_sync=False)
     assert result["running"] or result["phase"] == "complete"
