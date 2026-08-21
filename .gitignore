@@ -72,3 +72,6 @@ Thumbs.db
 desktop.ini
 .vscode/
 .idea/
+
+# Local agent/editor tooling configuration
+.claude/
