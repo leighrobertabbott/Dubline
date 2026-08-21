@@ -55,7 +55,7 @@ SAMPLE_RATE = 24_000
 # conditioning appears to pull timbre away from the speaker; re-raise it only
 # with a same-clip measurement showing it does not.
 SOURCE_EMOTION_STRENGTH = 0.6
-RETAKE_EMOTION_STRENGTH = 0.8
+RETAKE_EMOTION_STRENGTH = 0.6
 _whisper_models: dict[str, object] = {}
 _whisper_lock = threading.Lock()
 _run_context = threading.local()
@@ -1001,15 +1001,22 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 fitted_line = fitted / f"{index + 1:06d}.wav"
                 raw.unlink(missing_ok=True)
                 fitted_line.unlink(missing_ok=True)
-                item = dict(tts_items[index])
                 previous_text = cues[index].get("spoken_text")
                 cues[index]["spoken_text"] = apply_glossary(cues[index]["english"])
-                item["text"] = cues[index]["spoken_text"]
+                target = max(0.24, float(cues[index].get("dub_end", cues[index]["end"]))
+                             - float(cues[index].get("dub_start", cues[index]["start"])))
+                tts_items[index]["text"] = cues[index]["spoken_text"]
+                tts_items[index]["target"] = target
+                item = dict(tts_items[index])
                 if cues[index]["spoken_text"] != previous_text:
                     # The wording changed under timing pressure, which is exactly
-                    # when meaning gets dropped.  The verdict this line earned
+                    # when meaning gets dropped. The verdict this line earned
                     # belongs to the old wording and must not survive the rewrite.
                     cues[index].pop("translation_qc", None)
+                    if cues[index].get("performance_source") != "source performance":
+                        cues[index].pop("emotion_vector", None)
+                        tts_items[index]["emotion_vector"] = None
+                        item["emotion_vector"] = None
                     rewritten.append(index)
                 retry_items.append(item)
 
@@ -1070,7 +1077,7 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
                 (fitted / f"{index + 1:06d}.wav").unlink(missing_ok=True)
                 item = dict(tts_items[index])
                 item["text"] = cues[index].get("spoken_text") or apply_glossary(cues[index]["english"])
-                item["use_random"] = True
+                item["use_random"] = False
                 word_retry_items.append(item)
 
             def word_retry_progress(event: dict) -> None:
@@ -1164,17 +1171,20 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             kept = 0
             for index in performance_failures:
                 current = cues[index].get("qc", {}); retake = retake_cues[index].get("qc", {})
-                # Expression is never bought with intelligibility: a retake must
-                # not drop the line below the bar the word QC already enforces.
-                intelligible = (float(retake.get("word_similarity") or 0.0)
-                                >= min(float(current.get("word_similarity") or 0.0), .58))
-                current_score = (.45 * float(current.get("performance_similarity", .5))
+                # Expression is never bought with intelligibility or identity: a retake must
+                # not drop spoken accuracy or discard the cloned actor timbre.
+                current_word = float(current.get("word_similarity") or 0.0)
+                retake_word = float(retake.get("word_similarity") or 0.0)
+                intelligible = retake_word >= max(0.72, current_word - 0.04)
+                retains_identity = (float(retake.get("speaker_similarity", .5))
+                                    >= float(current.get("speaker_similarity", .5)) - 0.03)
+                current_score = (.35 * float(current.get("performance_similarity", .5))
                                  + .35 * float(current.get("speaker_similarity", .5))
-                                 + .20 * float(current.get("word_similarity", 0)))
-                retake_score = (.45 * float(retake.get("performance_similarity", .5))
+                                 + .30 * current_word)
+                retake_score = (.35 * float(retake.get("performance_similarity", .5))
                                 + .35 * float(retake.get("speaker_similarity", .5))
-                                + .20 * float(retake.get("word_similarity", 0)))
-                if intelligible and retake_score > current_score + .02:
+                                + .30 * retake_word)
+                if intelligible and retains_identity and retake_score > current_score + .03:
                     shutil.copy2(retake_dir / f"{index + 1:06d}.wav", fitted / f"{index + 1:06d}.wav")
                     cues[index]["qc"] = retake
                     cues[index]["qc"]["performance_retake"] = True
@@ -1262,6 +1272,9 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
         matched = folder / "acoustically-matched"
         update(82, "Matching dialogue tone, distance, and room sound")
         match_acoustics(cues, fitted, matched, reference_audio)
+        # Re-score speaker similarity on the delivered matched audio so QC reflects real output
+        score_speaker_similarity(cues, matched, speaker_references)
+        measure_performance_similarity(cues, matched)
         clean_background = background_stem
         if audio_mode == "separate" and background_stem.is_file():
             update(82.4, "Removing residual source dialogue from the music-and-effects bed")
@@ -2077,17 +2090,16 @@ def prepare_asr_windows(audio: Path, folder: Path, subtitle_hints: list[dict]) -
 
 
 def make_reference(audio: Path, cue: dict, output: Path, media_length: float,
-                   minimum: float = 3.0, padding: float = 0.8) -> None:
-    """Create a cue-contained reference; never widen into a neighbouring actor."""
+                   minimum: float = 0.5, padding: float = 0.12) -> None:
+    """Create a cue-contained reference without destructive silence padding."""
     cue_start, cue_end = float(cue["start"]), float(cue["end"])
     start = max(0.0, cue_start - min(.08, padding))
     end = min(media_length, cue_end + min(.08, padding))
     captured = max(.12, end - start)
-    desired = min(12.0, max(minimum, captured))
     run("ffmpeg", "-y", "-v", "error", "-ss", f"{start:.3f}", "-i", str(audio), "-t", f"{captured:.3f}",
-        "-af", f"loudnorm=I=-20:TP=-2:LRA=11,apad=whole_dur={desired:.3f},atrim=duration={desired:.3f}",
+        "-af", "loudnorm=I=-20:TP=-2:LRA=11",
         "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", str(output))
-    cue["reference_scope"] = "cue only; silence padded"
+    cue["reference_scope"] = "cue contained; clean dialogue"
 
 
 def audio_duration(path: Path) -> float:
@@ -2133,24 +2145,21 @@ def render_timeline(cues: list[dict], fitted_dir: Path, output: Path, duration: 
         fade = max(1, round(.025 * SAMPLE_RATE))
         for cue in cues:
             cue["overlap_source_preserved"] = False
-            spans = [(float(word["start"]), float(word["end"])) for word in cue.get("words", [])
-                     if word.get("start") is not None and word.get("end") is not None]
-            if not spans:
-                spans = [(float(cue["start"]), float(cue["end"]))]
-            for span_start, span_end in spans:
-                left = max(0, round((span_start - .035) * SAMPLE_RATE))
-                right = min(sample_count, round((span_end + .035) * SAMPLE_RATE))
-                if right <= left:
-                    continue
-                lead = min(fade, right - left); trail = min(fade, right - left)
-                if stereo:
-                    mix[left:left + lead] *= np.linspace(1, 0, lead)[:, None]
-                    mix[left + lead:right - trail] = 0
-                    mix[right - trail:right] *= np.linspace(0, 1, trail)[:, None]
-                else:
-                    mix[left:left + lead] *= np.linspace(1, 0, lead)
-                    mix[left + lead:right - trail] = 0
-                    mix[right - trail:right] *= np.linspace(0, 1, trail)
+            cue_start = min(float(cue.get("dub_start", cue["start"])), float(cue["start"]))
+            cue_end = max(float(cue.get("dub_end", cue["end"])), float(cue["end"]))
+            left = max(0, round((cue_start - .05) * SAMPLE_RATE))
+            right = min(sample_count, round((cue_end + .05) * SAMPLE_RATE))
+            if right <= left:
+                continue
+            lead = min(fade, right - left); trail = min(fade, right - left)
+            if stereo:
+                mix[left:left + lead] *= np.linspace(1, 0, lead)[:, None]
+                mix[left + lead:right - trail] = 0
+                mix[right - trail:right] *= np.linspace(0, 1, trail)[:, None]
+            else:
+                mix[left:left + lead] *= np.linspace(1, 0, lead)
+                mix[left + lead:right - trail] = 0
+                mix[right - trail:right] *= np.linspace(0, 1, trail)
     for index, cue in enumerate(cues, 1):
         line = fitted_dir / f"{int(cue.get('_audio_line', index)):06d}.wav"
         frames, rate = sf.read(line, dtype="float32", always_2d=True)
@@ -2219,7 +2228,7 @@ def match_acoustics(cues: list[dict], fitted_dir: Path, output_dir: Path,
                 gen_levels = band_levels(generated, generated_rate, centers)
                 raw_gains = [10 * np.log10(ref / gen) for ref, gen in zip(ref_levels, gen_levels)]
                 offset = float(np.median(raw_gains))
-                match_gains = [float(np.clip(value - offset, -4.0, 4.0)) for value in raw_gains]
+                match_gains = [float(np.clip(value - offset, -1.5, 1.5)) for value in raw_gains]
         filters = ["highpass=f=70", f"lowpass=f={lowpass}"]
         # Residual register match, after the retakes have had their chance.
         # Formant-preserving shifting moves the fundamental toward the actor
@@ -2235,11 +2244,6 @@ def match_acoustics(cues: list[dict], fitted_dir: Path, output_dir: Path,
                     for center, gain in zip(centers, match_gains) if abs(gain) >= .2]
         filters += ["deesser=i=0.18:m=0.28:f=0.5",
                     "acompressor=threshold=0.14:ratio=2:attack=8:release=110:makeup=1.05"]
-        tail_ratio = float(performance.get("tail_ratio", 0.0))
-        reflection_decay = float(np.clip(tail_ratio * .18, 0.0, .12))
-        if reflection_decay >= .018:
-            delay = int(np.clip(16 + tail_ratio * 42, 18, 58))
-            filters.append(f"aecho=0.8:0.10:{delay}:{reflection_decay:.3f}")
         filters += ["alimiter=limit=0.94", "volume=0.98"]
         run("ffmpeg", "-y", "-v", "error", "-i", str(source), "-af", ",".join(filters),
             "-ar", str(SAMPLE_RATE), "-ac", "1", "-c:a", "pcm_s16le", str(output))
@@ -2252,8 +2256,6 @@ def match_acoustics(cues: list[dict], fitted_dir: Path, output_dir: Path,
             "distance": distance, "lowpass_hz": lowpass,
             "match_eq_db": {str(center): round(value, 2)
                             for center, value in zip(centers, match_gains)},
-            "reflection_decay": round(reflection_decay, 3),
-            "early_reflections": reflection_decay >= .018,
             "level_match_db": round(20 * np.log10(gain), 2),
         }
 

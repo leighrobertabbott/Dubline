@@ -515,7 +515,10 @@ async function editAndRegenerate(button) {
   if (source === null) return;
   const revised = prompt('English dialogue', button.dataset.text);
   if (!revised) return;
-  const speaker = prompt('Character name (renames this voice across the project)', cue?.speaker || '');
+  const speakerIdInput = prompt('Voice ID number (e.g. 1, 2, 3... or 0 for uncertain):', cue?.speaker_id ?? 1);
+  if (speakerIdInput === null) return;
+  const speakerId = parseInt(speakerIdInput, 10);
+  const speaker = prompt('Character name for display:', cue?.speaker || '');
   if (speaker === null || !speaker.trim()) return;
   const startText = prompt('Line start (MM:SS or HH:MM:SS)', formatCueTime(cue?.start || 0));
   if (startText === null) return;
@@ -523,13 +526,16 @@ async function editAndRegenerate(button) {
   if (endText === null) return;
   const start=parseClock(startText), end=parseClock(endText);
   if(start===null || end===null || end<=start)return toast('Enter a start and an end after it.');
+  const payload = {source:source.trim(),english:revised.trim(),speaker_name:speaker.trim(),start,end};
+  if (!isNaN(speakerId)) payload.speaker_id = speakerId;
   const unchanged = revised.trim() === String(cue?.english || '').trim()
     && source.trim() === String(cue?.source || '').trim()
     && speaker.trim() === String(cue?.speaker || '').trim()
+    && (!('speaker_id' in payload) || payload.speaker_id === cue?.speaker_id)
     && Math.abs(start-Number(cue?.start||0))<.001 && Math.abs(end-Number(cue?.end||0))<.001;
   if (unchanged) return;
   try {
-    const edited = await api(`/api/jobs/${state.activeId}/cues/${button.dataset.cue}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify({source:source.trim(),english:revised.trim(),speaker_name:speaker.trim(),start,end})});
+    const edited = await api(`/api/jobs/${state.activeId}/cues/${button.dataset.cue}`, {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     if (state.activeJob?.stage === 'Translation ready for approval') {
       state.activeJob = edited; renderJob(edited); toast('Translation updated.');
     } else {

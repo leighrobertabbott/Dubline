@@ -127,15 +127,15 @@ def fuse_visual_speakers(cues: list[dict], visual: dict[int, dict]) -> dict:
         evidence = visual.get(int(cue["id"]), {})
         cue["visual_speaker"] = evidence
         face_id = evidence.get("active_face_id")
-        if (face_id and float(evidence.get("active_speaker_confidence", 0)) >= .68
-                and float(cue.get("speaker_confidence", 0)) >= .62):
+        if (face_id and float(evidence.get("active_speaker_confidence", 0)) >= .70
+                and float(cue.get("speaker_confidence", 0)) >= .75):
             votes[int(face_id)][int(cue["speaker_id"])] += (
                 float(evidence["active_speaker_confidence"]) * float(cue["speaker_confidence"]))
     anchors = {}
     for face_id, weights in votes.items():
         ranked = sorted(weights.items(), key=lambda item: item[1], reverse=True)
         total = sum(weights.values())
-        if ranked and total and ranked[0][1] / total >= .72:
+        if ranked and total and ranked[0][1] / total >= .60:
             anchors[face_id] = (ranked[0][0], ranked[0][1] / total)
     reassigned = 0
     for cue in cues:
@@ -143,7 +143,8 @@ def fuse_visual_speakers(cues: list[dict], visual: dict[int, dict]) -> dict:
         face_id = evidence.get("active_face_id")
         anchor = anchors.get(int(face_id)) if face_id else None
         if (anchor and float(evidence.get("active_speaker_confidence", 0)) >= .72
-                and float(cue.get("speaker_confidence", 0)) < .62):
+                and (float(cue.get("speaker_confidence", 0)) < .62
+                     or float(evidence.get("active_speaker_confidence", 0)) > float(cue.get("speaker_confidence", 0)) + 0.15)):
             cue["speaker_id"] = anchor[0]
             cue["speaker"] = f"Voice {anchor[0]}"
             cue["speaker_confidence"] = round(.6 * float(evidence["active_speaker_confidence"])
@@ -154,15 +155,15 @@ def fuse_visual_speakers(cues: list[dict], visual: dict[int, dict]) -> dict:
 
     # A short diagnostic scene can collapse two actors into one audio cluster.
     # Repeated, decisive mouth activity from an otherwise unanchored recurring
-    # face is enough to create an anonymous voice identity, but only for lines
-    # whose audio assignment was already tentative.
+    # face is enough to create an anonymous voice identity when visual evidence is strong.
     candidates: dict[int, list[dict]] = defaultdict(list)
     for cue in cues:
         evidence = cue.get("visual_speaker", {})
         face_id = evidence.get("active_face_id")
         if (face_id and int(face_id) not in anchors and cue.get("mouth_visible")
                 and float(evidence.get("active_speaker_confidence", 0)) >= .82
-                and float(cue.get("speaker_confidence", 0)) < .62):
+                and (float(cue.get("speaker_confidence", 0)) < .62
+                     or float(evidence.get("active_speaker_confidence", 0)) > float(cue.get("speaker_confidence", 0)) + 0.18)):
             candidates[int(face_id)].append(cue)
     next_speaker = max((int(cue.get("speaker_id", 0)) for cue in cues), default=0) + 1
     created = 0

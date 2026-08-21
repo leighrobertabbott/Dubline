@@ -180,15 +180,17 @@ def main() -> None:
             except cv2.error:
                 continue
             scores = [float(np.dot(embedding, value)) for value in prototypes]
-            # SFace's published same-identity cosine boundary is roughly .36 on
-            # LFW.  Use a slightly more conservative .37 so shot/angle changes
-            # do not fragment one actor into several identities.
-            identity = int(np.argmax(scores)) if scores and max(scores) >= .37 else len(prototypes)
+            # SFace cosine boundary: use 0.52 to prevent merging different faces across scenes,
+            # and only update the prototype representation on high-confidence matches (>= 0.60).
+            identity = int(np.argmax(scores)) if scores and max(scores) >= .52 else len(prototypes)
             if identity == len(prototypes):
                 prototypes.append(embedding); prototype_counts.append(1)
             else:
                 count = prototype_counts[identity]
-                prototypes[identity] = unit((prototypes[identity] * count + embedding) / (count + 1))
+                if scores[identity] >= .60:
+                    # Bound maximum sample count to prevent prototype immutability while preventing drift
+                    effective_count = min(count, 20)
+                    prototypes[identity] = unit((prototypes[identity] * effective_count + embedding) / (effective_count + 1))
                 prototype_counts[identity] += 1
             patch = mouth_patch(gray, face)
             motion = 0.0

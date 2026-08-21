@@ -61,10 +61,43 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
     preserve_diarization = all("speaker_id" in cue for cue in cues)
     labels = cluster_embeddings(np.stack(embeddings)) if embeddings and not preserve_diarization else np.zeros(0, dtype=int)
     if preserve_diarization:
+        # Cross-reference Pyannote diarization assignments against independent CAMPPlus voice embeddings
+        speaker_vectors: dict[int, list[np.ndarray]] = defaultdict(list)
+        cue_emb_map: dict[int, np.ndarray] = {}
+        for index, emb in zip(valid_indices, embeddings):
+            spk = int(cues[index].get("speaker_id", 0))
+            if spk > 0:
+                speaker_vectors[spk].append(emb)
+                cue_emb_map[index] = emb
+
+        centroids: dict[int, np.ndarray] = {}
+        for spk, vecs in speaker_vectors.items():
+            if vecs:
+                c = np.mean(vecs, axis=0)
+                norm = np.linalg.norm(c)
+                if norm > 1e-6:
+                    centroids[spk] = c / norm
+
         for index, cue in enumerate(cues):
             metrics = qualities.get(index, {})
             cue["reference_quality"] = float(metrics.get("score", 0.0))
             cue["reference_metrics"] = metrics
+            if index in cue_emb_map and int(cue.get("speaker_id", 0)) in centroids:
+                emb = cue_emb_map[index]
+                spk = int(cue["speaker_id"])
+                sim_own = float(np.dot(emb, centroids[spk]))
+                competing = [float(np.dot(emb, c)) for s, c in centroids.items() if s != spk]
+                sim_other = max(competing) if competing else 0.0
+                cue["acoustic_similarity"] = round(sim_own, 3)
+                if sim_own < 0.40 or sim_other > sim_own + 0.05:
+                    # Acoustic outlier or merged cluster; demote confidence so this line
+                    # cannot poison character reference banks
+                    cue["speaker_confidence"] = min(float(cue.get("speaker_confidence", 0.0)), 0.40)
+                    cue["acoustic_outlier"] = True
+                else:
+                    cue["speaker_confidence"] = round(
+                        0.5 * float(cue.get("speaker_confidence", 0.9)) + 0.5 * float(np.clip(sim_own, 0.0, 1.0)), 3
+                    )
         output_dir.mkdir(parents=True, exist_ok=True)
         references = build_reference_bank(dialogue_audio, cues, output_dir)
         del model
@@ -75,6 +108,15 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
     valid_assignment_indices = set(assignments)
     for index in range(len(cues)):
         assignments.setdefault(index, -1)
+
+    # Calculate cluster centroids to derive real silhouette/margin confidence
+    cluster_vectors: dict[int, list[np.ndarray]] = defaultdict(list)
+    for index, emb in zip(valid_indices, embeddings):
+        lbl = assignments[index]
+        if lbl >= 0:
+            cluster_vectors[lbl].append(emb)
+    cluster_centroids = {lbl: (np.mean(vecs, axis=0) / (np.linalg.norm(np.mean(vecs, axis=0)) + 1e-9))
+                         for lbl, vecs in cluster_vectors.items() if vecs}
 
     # Stable, human-readable numbering follows first appearance rather than cluster internals.
     ordered: dict[int, int] = {}
@@ -94,7 +136,14 @@ def analyze_speakers(dialogue_audio: Path, cues: list[dict], output_dir: Path) -
         assignments[index] = speaker_id
         cues[index]["speaker_id"] = speaker_id
         cues[index]["speaker"] = f"Voice {speaker_id}"
-        cues[index]["speaker_confidence"] = 0.9 if index in valid_assignment_indices else 0.0
+        if index in valid_assignment_indices and cluster in cluster_centroids:
+            emb = embeddings[valid_indices.index(index)]
+            sim_own = float(np.dot(emb, cluster_centroids[cluster]))
+            other_sims = [float(np.dot(emb, c)) for c_lbl, c in cluster_centroids.items() if c_lbl != cluster]
+            margin = sim_own - (max(other_sims) if other_sims else 0.0)
+            cues[index]["speaker_confidence"] = round(float(np.clip(0.60 + 0.35 * margin, 0.35, 0.95)), 3)
+        else:
+            cues[index]["speaker_confidence"] = 0.0
         metrics = qualities.get(index, {})
         cues[index]["reference_quality"] = float(metrics.get("score", 0.0))
         cues[index]["reference_metrics"] = metrics

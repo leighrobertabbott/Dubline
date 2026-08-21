@@ -231,7 +231,66 @@ def assign_diarized_speakers(cues: list[dict], result: dict) -> None:
         label, amount = ranked[selected_rank]
         cue["speaker_id"] = label_order[label]
         cue["speaker"] = f"Voice {label_order[label]}"
-        cue["speaker_confidence"] = round(min(0.98, amount / duration) *
+        cue["temporal_overlap"] = round(min(1.0, amount / duration), 3)
+        cue["speaker_confidence"] = round(min(0.95, 0.45 + 0.50 * (amount / duration)) *
                                            (0.62 if cue["overlapping_speech"] else 1.0), 3)
         cue["diarization_label"] = label
         cue["speaker_assignment"] = "confident" if cue["speaker_confidence"] >= 0.62 else "tentative"
+
+
+# A speaker's conversational pitch stays within a few semitones of their own
+# median. A diarization cluster spanning much more than that is not one person,
+# it is several merged -- the documented failure mode of clustering diarizers on
+# dramatic speech, where deliberate vocal variation defeats embeddings trained on
+# natural conversation. Cloning a line from a merged cluster reproduces whichever
+# actor dominated it, so the outliers are demoted to their own voice instead.
+CLUSTER_SPREAD_LIMIT_SEMITONES = 8.0
+CLUSTER_OUTLIER_SEMITONES = 4.0
+INCOHERENT_CLUSTER_CONFIDENCE = 0.55
+
+
+def _fold_octave(value: float, median: float) -> float:
+    """Pitch trackers report an octave error as an exact doubling or halving."""
+    import math
+
+    return min((value, value * 2, value / 2), key=lambda option: abs(math.log2(option / median)))
+
+
+def demote_incoherent_speaker_clusters(cues: list[dict]) -> dict:
+    """Withdraw cluster identity from lines it cannot acoustically belong to.
+
+    Returns a summary; mutates only the confidence of the offending lines, so
+    the existing cloning gate routes them to their own source voice.
+    """
+    import math
+    from collections import defaultdict
+
+    groups: dict[object, list[dict]] = defaultdict(list)
+    for cue in cues:
+        pitch = float((cue.get("source_performance") or {}).get("pitch_hz") or 0.0)
+        if pitch > 0 and cue.get("speaker_id") is not None:
+            groups[cue["speaker_id"]].append(cue)
+
+    demoted, incoherent = 0, []
+    for speaker_id, members in groups.items():
+        if len(members) < 3:
+            continue
+        pitches = [float(cue["source_performance"]["pitch_hz"]) for cue in members]
+        median = float(np.median(pitches))
+        folded = [_fold_octave(value, median) for value in pitches]
+        spread = 12 * math.log2(max(folded) / min(folded))
+        if spread <= CLUSTER_SPREAD_LIMIT_SEMITONES:
+            continue
+        incoherent.append({"speaker_id": speaker_id, "lines": len(members),
+                           "spread_semitones": round(spread, 1)})
+        centre = float(np.median(folded))
+        for cue, value in zip(members, folded):
+            distance = abs(12 * math.log2(value / centre))
+            if distance <= CLUSTER_OUTLIER_SEMITONES:
+                continue
+            cue["speaker_confidence"] = round(
+                min(float(cue.get("speaker_confidence") or 1.0), INCOHERENT_CLUSTER_CONFIDENCE), 3)
+            cue["speaker_assignment"] = "withdrawn: cluster is not one voice"
+            cue["cluster_pitch_distance_semitones"] = round(distance, 1)
+            demoted += 1
+    return {"incoherent_clusters": incoherent, "demoted_lines": demoted}

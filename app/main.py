@@ -560,12 +560,21 @@ async def edit_cue(job_id: str, cue_id: int, change: CueUpdate):
     if float(cue["end"]) <= float(cue["start"]):
         raise HTTPException(400, "Line end must be after its start")
     if "speaker_id" in values:
+        old_spk = cue.get("speaker_id")
         cue["speaker_id"] = values["speaker_id"]
         cue["speaker"] = "Uncertain voice" if values["speaker_id"] == 0 else f"Voice {values['speaker_id']}"
+        cue["speaker_confidence"] = 1.0  # Explicit human assignment
+        cue["speaker_assignment"] = "human correction"
+        if old_spk != values["speaker_id"]:
+            folder = Path(job["folder"])
+            for spk in (old_spk, values["speaker_id"]):
+                if spk is not None:
+                    (folder / "speaker-references" / f"voice-{int(spk):03d}.wav").unlink(missing_ok=True)
+                    (folder / "speaker-references" / f"voice-{int(spk):03d}.json").unlink(missing_ok=True)
     if "speaker_name" in values:
         new_name = values["speaker_name"].strip()
         speaker_id = cue.get("speaker_id")
-        # A character name is project-wide.  Rename every line already assigned
+        # A character name is project-wide. Rename every line already assigned
         # to the same voice instead of silently changing only one subtitle card.
         for item in cues:
             if speaker_id is not None and item.get("speaker_id") == speaker_id:
