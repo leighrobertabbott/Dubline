@@ -11,6 +11,23 @@ ENV_FILE = BASE / ".env"
 _TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_\-]{10,512}$")
 _TMDB_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_.\-]{20,2048}$")
 
+# Dubline's own TMDB application token, shipped with the app so that someone who
+# just wants to dub a film never has to register an account.  This is the same
+# arrangement Kodi's official scraper addon uses, and TMDB's API is designed for
+# one application credential serving a whole user base.
+#
+# This value is PUBLIC BY DESIGN.  Anyone who downloads Dubline can read it, so:
+#   * it must be a token created solely for Dubline and used for nothing else;
+#   * it is disposable - if TMDB ever rate-limits or revokes it, paste a new one
+#     here and cut a release;
+#   * every install shares its rate limit, which is why artwork is cached
+#     per project and looked up once per title.
+#
+# A user's own token always wins over this one.  Forks should leave it empty:
+# an empty value simply falls back to the "Developer catalogue override" panel
+# in Setup, and TV lookups keep working through TVmaze either way.
+BUNDLED_TMDB_TOKEN = ""
+
 
 def load_local_environment(path: Path = ENV_FILE) -> None:
     """Load Dubline's small local .env file without overriding the shell."""
@@ -40,6 +57,11 @@ def load_local_environment(path: Path = ENV_FILE) -> None:
     bundled_tools = BASE / "vendor" / "ffmpeg" / "bin"
     if bundled_tools.is_dir():
         os.environ["PATH"] = str(bundled_tools) + os.pathsep + os.environ.get("PATH", "")
+    # Applied last and only into an empty slot, so a shell variable or a token
+    # the user saved in Setup always takes precedence over the shipped one.
+    # setdefault is not enough here: .env ships the key present but blank.
+    if BUNDLED_TMDB_TOKEN and not os.environ.get("DUBLINE_TMDB_TOKEN", "").strip():
+        os.environ["DUBLINE_TMDB_TOKEN"] = BUNDLED_TMDB_TOKEN.strip()
 
 
 def validate_hf_token(token: str) -> str:

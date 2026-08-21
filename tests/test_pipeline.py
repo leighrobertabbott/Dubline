@@ -16,10 +16,11 @@ from app.services.pipeline import (allocate_dub_windows, hydrate_alignment_confi
                                    source_asr_verification_candidates)
 from app.services.dialogue import build_adaptive_dialogue, suppress_dialogue_leakage
 from app.services.adapter_worker import (choose_candidate, faithful_pass, hard_line,
-                                         parse_candidates)
+                                         parse_candidates, scene_line)
 from app.services.llm import (decode_json, gguf_block_count, gpu_layer_count,
                               response_tokens, scrape_string_fields)
 from app.services.translation_qc_worker import parse_json as parse_translation_qc_json
+from app.services.translation_qc_worker import semantic_scores
 from app.services.qc import (PERFORMANCE_RETAKE_THRESHOLD, inspect_cues,
                              measure_performance_similarity, register_correction,
                              voice_fidelity_summary)
@@ -453,6 +454,225 @@ def test_an_unreliable_second_reading_never_de_rates_a_transcript():
     assert cues[0]["transcription_confidence"] == .95
 
 
+def test_echoed_template_scores_are_not_mistaken_for_a_judgement():
+    # The judge fills the booleans and writes a real reason, but copies the
+    # numbers the schema showed it. Believing those zeroes fails every line.
+    scores, reported = semantic_scores(
+        {"id": 1, "adequacy": 0.0, "names": 0.0, "register": 0.0,
+         "contradiction": False, "evidence_sufficient": True,
+         "reason": "equivalent meaning and intent"})
+    assert reported is False
+    assert scores["adequacy"] == 0.0
+
+
+def test_real_scores_are_read_on_either_scale():
+    percent, reported = semantic_scores({"adequacy": 93, "names": 97, "register": 88})
+    assert reported is True
+    assert percent["adequacy"] == 0.93 and percent["names"] == 0.97
+    unit, reported = semantic_scores({"adequacy": .93, "names": .97, "register": .88})
+    assert reported is True
+    assert unit["adequacy"] == .93
+    # A genuine zero alongside real scores is still a judgement, not an echo.
+    mixed, reported = semantic_scores({"adequacy": 0, "names": 91, "register": 80})
+    assert reported is True and mixed["adequacy"] == 0.0
+
+
+def test_missing_scores_are_not_invented():
+    scores, reported = semantic_scores({"adequacy": 90})
+    assert reported is False
+    assert scores["names"] == 0.0 and scores["register"] == 0.0
+
+
+def test_a_comparison_directory_holds_one_take_per_line(tmp_path: Path):
+    # QC and similarity read these directories positionally. A directory holding
+    # only the regenerated lines fails on the first line that was not.
+    from app.services.pipeline import mirror_current_takes
+    fitted = tmp_path / "fitted"; fitted.mkdir()
+    comparison = tmp_path / "retakes"; comparison.mkdir()
+    for index in range(1, 6):
+        (fitted / f"{index:06d}.wav").write_bytes(b"original")
+    # Only line 3 was re-performed.
+    (comparison / "000003.wav").write_bytes(b"retaken")
+
+    mirrored = mirror_current_takes(fitted, comparison, 5)
+
+    assert mirrored == 4
+    assert sorted(p.name for p in comparison.glob("*.wav")) == [
+        f"{index:06d}.wav" for index in range(1, 6)]
+    # The regenerated take must survive; the rest are the current ones.
+    assert (comparison / "000003.wav").read_bytes() == b"retaken"
+    assert (comparison / "000001.wav").read_bytes() == b"original"
+
+
+def test_mirroring_creates_a_missing_comparison_directory(tmp_path: Path):
+    from app.services.pipeline import mirror_current_takes
+    fitted = tmp_path / "fitted"; fitted.mkdir()
+    (fitted / "000001.wav").write_bytes(b"x")
+    assert mirror_current_takes(fitted, tmp_path / "fresh", 1) == 1
+    assert (tmp_path / "fresh" / "000001.wav").is_file()
+
+
+def test_a_contested_line_does_not_present_one_reading_as_the_source():
+    cues = [{"id": 1, "source": "A-reading", "source_language": "japanese",
+             "source_asr_disputed": True,
+             "asr_second_opinion": {"text": "B-reading", "word_confidence": .96,
+                                    "english_translation": "the B meaning"}}]
+    rendered = scene_line(cues, 0)
+    assert "CONTESTED" in rendered
+    # Neither reading may be labelled SOURCE, which is what made the model
+    # faithfully translate the mistranscription.
+    assert "SOURCE" not in rendered
+    assert "A-reading" in rendered and "B-reading" in rendered
+    # The independent English must be visible, not buried in a JSON blob.
+    assert "the B meaning" in rendered
+
+
+def test_an_agreed_line_keeps_the_plain_source_framing():
+    cues = [{"id": 1, "source": "agreed text", "source_language": "japanese",
+             "asr_second_opinion": {"text": "agreed text", "word_confidence": .9}}]
+    rendered = scene_line(cues, 0)
+    assert "SOURCE" in rendered and "CONTESTED" not in rendered
+
+
+def test_scene_line_omits_evidence_it_does_not_have():
+    cues = [{"id": 1, "source": "plain", "source_language": "japanese"}]
+    rendered = scene_line(cues, 0)
+    assert "SUPPLIED SUBTITLE" not in rendered
+    assert "PRIOR INDEPENDENT QC" not in rendered
+    assert "SECOND ASR OPINION" not in rendered
+
+
+def test_a_subtitle_cue_records_the_distributor_translation():
+    subtitles = [{"start": 2.781, "end": 5.811,
+                  "text": "Pay you back out of our synchro take at the Festival."}]
+    asr = [{"start": 2.7, "end": 5.8, "source": "弁償します",
+            "source_language": "Japanese", "transcription_confidence": .9,
+            "alignment_confidence": .9,
+            "words": [{"word": "弁償", "start": 2.8, "end": 3.2, "probability": .9},
+                      {"word": "します", "start": 3.2, "end": 3.6, "probability": .9}]}]
+    cue = reconcile_subtitles_with_asr(subtitles, asr)[0]
+    assert cue["supplied_translation"] == subtitles[0]["text"]
+
+
+def test_a_machine_translation_never_becomes_supplied_evidence(capsys):
+    # The distributor subtitle is the only thing that may occupy this field.
+    # Promoting the model's own output here made it corroborate itself on the
+    # next pass, and told the QC judge a hallucination was human evidence.
+    cues = [{"id": 1, "start": 0, "end": 3, "source": "弁償します",
+             "source_language": "japanese", "translation_was_supplied": True,
+             "english": "an earlier machine guess",
+             "literal_translation": "an earlier machine guess"}]
+    llm = _ScriptedLlama(['{"0":"a fresh translation"}'])
+    faithful_pass(llm, cues)
+    capsys.readouterr()
+    assert cues[0].get("supplied_translation") in (None, "")
+    assert cues[0]["english"] == "a fresh translation"
+    assert "SUPPLIED SUBTITLE" not in llm.prompts[0]
+
+
+def test_a_real_subtitle_survives_translation(capsys):
+    subtitle = "Pay you back out of our synchro take at the Festival."
+    cues = [{"id": 1, "start": 0, "end": 3, "source": "弁償します",
+             "source_language": "japanese", "supplied_translation": subtitle,
+             "literal_translation": subtitle, "english": subtitle}]
+    llm = _ScriptedLlama(['{"0":"We will pay you back from the festival takings."}'])
+    faithful_pass(llm, cues)
+    capsys.readouterr()
+    # The model translates, but the distributor's wording is preserved intact
+    # for every later comparison.
+    assert cues[0]["supplied_translation"] == subtitle
+    assert cues[0]["literal_translation"] == subtitle
+    assert cues[0]["english"] != subtitle
+    assert "SUPPLIED SUBTITLE" in llm.prompts[0]
+
+
+def test_speaking_rate_never_leaves_a_natural_band():
+    from app.services.tts import natural_duration_factor
+    # These are the values the pipeline actually asked for on a real run: the
+    # ceiling produced half-speed vowels ("iiinnnn aaaaa weeeeeek"), the floor
+    # produced clipped, gabbled speech.
+    assert natural_duration_factor(2.0) <= 1.16
+    assert natural_duration_factor(0.5) >= 0.86
+    assert natural_duration_factor(1.666) <= 1.16
+    assert natural_duration_factor(0.684) >= 0.86
+    # A natural request passes through untouched.
+    assert natural_duration_factor(1.02) == 1.02
+    assert natural_duration_factor(0.95) == 0.95
+
+
+def test_the_rate_band_is_configurable(monkeypatch):
+    from app.services.tts import natural_duration_factor
+    monkeypatch.setenv("DUB_RATE_FLOOR", "0.80")
+    monkeypatch.setenv("DUB_RATE_CEILING", "1.25")
+    assert natural_duration_factor(0.5) == 0.80
+    assert natural_duration_factor(2.0) == 1.25
+    # The engine's own hard limits still bound a nonsense setting.
+    monkeypatch.setenv("DUB_RATE_FLOOR", "0.1")
+    monkeypatch.setenv("DUB_RATE_CEILING", "9")
+    assert natural_duration_factor(0.01) >= 0.5
+    assert natural_duration_factor(99) <= 2.0
+
+
+def test_pace_model_matches_measured_synthesis():
+    from app.services.adapter_worker import NATURAL_WORDS_PER_SECOND, estimated_pace_seconds
+    # Calibrated against real takes rendered at factor 0.95-1.10 on this
+    # pipeline. The old 2.65 constant overstated spoken length by ~28%, so
+    # every duration target handed to the LLM was too generous.
+    assert 3.2 <= NATURAL_WORDS_PER_SECOND <= 3.6
+    # Twelve words should predict roughly three and a half seconds, not four and a half.
+    assert 3.2 <= estimated_pace_seconds(" ".join(["word"] * 12)) <= 3.9
+
+
+def test_word_budget_brackets_the_window():
+    from app.services.adapter_worker import word_budget
+    low, ideal, high = word_budget(3.0)
+    assert low < ideal < high
+    # +/-10% is the isometric standard the budget has to express.
+    assert abs(low / ideal - 0.9) < 0.12 and abs(high / ideal - 1.1) < 0.12
+    # A very short window still asks for at least one word.
+    assert word_budget(0.1)[0] >= 1
+
+
+def test_length_inside_the_band_is_not_penalised():
+    from app.services.adapter_worker import choose_candidate
+    # Two candidates judged equally well; one fits the window, one is far too
+    # long. The fitting one must win on length alone.
+    semantic = [{"index": 0, "adequacy": .9, "terminology": .9, "register": .9},
+                {"index": 1, "adequacy": .9, "terminology": .9, "register": .9}]
+    fits = "It will be in a week"
+    overlong = ("It will most certainly be happening in approximately one week from now "
+                "as far as anybody here can reasonably tell")
+    selected, _ = choose_candidate(fits, [overlong], 1.79, True, semantic=semantic)
+    assert selected == fits
+
+    # And the reverse: when the faithful line overruns, a compliant rewrite wins.
+    selected, _ = choose_candidate(overlong, [fits], 1.79, True, semantic=semantic)
+    assert selected == fits
+
+
+def test_identity_is_not_judged_on_an_unreliable_measurement(tmp_path: Path):
+    import soundfile as sf
+    rate = SAMPLE_RATE
+    time = np.arange(int(rate * 2.0)) / rate
+    sf.write(tmp_path / "000001.wav", (.15 * np.sin(2 * np.pi * 180 * time)).astype(np.float32), rate)
+    sf.write(tmp_path / "000002.wav", (.15 * np.sin(2 * np.pi * 180 * time)).astype(np.float32), rate)
+
+    def flags(reliable: bool) -> list[str]:
+        cues = [{"id": 1, "start": 0.0, "end": 2.0, "english": "Line.",
+                 "source_performance": {"pitch_hz": 180.0, "rms": .1},
+                 "qc": {"speaker_similarity": 0.30, "active_duration": 1.9,
+                        "speaker_similarity_reliable": reliable}}]
+        inspect_cues(cues, tmp_path)
+        return cues[0]["review_reasons"]
+
+    identity = "generated voice identity differs from the source reference"
+    # A take long enough to embed reliably is judged.
+    assert any(identity in reason for reason in flags(True))
+    # A take too short for the embedding to mean anything is reported, not judged:
+    # duration noise alone moves this score by more than the gate's margin.
+    assert not any(identity in reason for reason in flags(False))
+
+
 def test_qc_flags_large_stretch_and_word_mismatch(tmp_path: Path):
     import soundfile as sf
     fitted = tmp_path / "fitted"; fitted.mkdir()
@@ -746,7 +966,7 @@ def test_uncertain_speaker_does_not_contaminate_character_bank(tmp_path: Path):
 def test_character_bank_keeps_acoustically_distinct_takes(tmp_path: Path):
     import soundfile as sf
     rate = SAMPLE_RATE
-    # One character heard twice: a low, quiet delivery and a high, loud one.
+
     def voiced(frequency: float, amplitude: float, seconds: float) -> np.ndarray:
         time = np.arange(int(rate * seconds)) / rate
         wave = sum(amplitude / (harmonic ** 1.4)
@@ -755,22 +975,85 @@ def test_character_bank_keeps_acoustically_distinct_takes(tmp_path: Path):
         return wave.astype(np.float32)
 
     audio = tmp_path / "dialogue.wav"
-    # A real gap between deliveries, so neither read bleeds into the other.
     silence = np.zeros(int(rate * 1.0), dtype=np.float32)
     sf.write(audio, np.concatenate([voiced(110, .10, 4.0), silence, voiced(210, .30, 4.0)]), rate)
     cues = [{"start": 0.0, "end": 4.0, "speaker_id": 1, "speaker_confidence": .9,
              "reference_quality": .8, "overlapping_speech": False, "source": "Quiet line."},
             {"start": 5.0, "end": 9.0, "speaker_id": 1, "speaker_confidence": .9,
              "reference_quality": .8, "overlapping_speech": False, "source": "Loud line."}]
-    references = build_reference_bank(audio, cues, tmp_path / "references")
-    variants = load_reference_variants(tmp_path / "references")
-    assert len(variants.get(1, [])) >= 2, "distinct deliveries must not collapse to one take"
+    build_reference_bank(audio, cues, tmp_path / "references")
+    entries = load_reference_variants(tmp_path / "references").get(1, [])
 
-    def chosen(pitch: float) -> str:
-        path, basis = select_reference(
-            {"source_performance": {"pitch_hz": pitch}}, variants[1], references[1])
-        assert basis.startswith("nearest take")
-        return path.name
+    assert sum(1 for item in entries if item.get("canonical")) == 1, "the curated clip must compete"
+    assert len(entries) >= 2, "distinct deliveries must not collapse to one take"
+    # Every candidate is vetted, so a variant can never be a worse recording
+    # than the curated clip it would displace.
+    assert all(item.get("quality", 0) >= .48 for item in entries)
 
-    # Each line reaches for the take that matches how it was actually delivered.
-    assert chosen(112.0) != chosen(208.0)
+
+def test_the_curated_clip_is_the_default_reference(tmp_path: Path):
+    canonical = tmp_path / "voice-001.wav"; alternate = tmp_path / "take-001-00.wav"
+    for path in (canonical, alternate):
+        path.write_bytes(b"RIFF")
+    variants = [
+        {"path": str(canonical), "canonical": True, "quality": .8,
+         "profile": {"pitch_hz": 180, "spectral_centroid_hz": 2000, "rms": .05}},
+        {"path": str(alternate), "quality": .8,
+         "profile": {"pitch_hz": 176, "spectral_centroid_hz": 2050, "rms": .05}},
+    ]
+    # A line the curated clip already fits keeps it, even though another take is
+    # fractionally nearer. Swapping a curated reference for a marginal gain is
+    # exactly how voice identity was lost.
+    path, basis = select_reference(
+        {"source_performance": {"pitch_hz": 178, "spectral_centroid_hz": 2020, "rms": .05}},
+        variants, canonical)
+    assert path == canonical and basis == "character bank"
+
+    # A line genuinely delivered in another register does switch.
+    variants[1]["profile"] = {"pitch_hz": 120, "spectral_centroid_hz": 1200, "rms": .02}
+    path, basis = select_reference(
+        {"source_performance": {"pitch_hz": 121, "spectral_centroid_hz": 1210, "rms": .02}},
+        variants, canonical)
+    assert path == alternate and basis.startswith("nearest take")
+
+
+def test_an_unmeasured_line_keeps_the_curated_clip(tmp_path: Path):
+    canonical = tmp_path / "voice-001.wav"; canonical.write_bytes(b"RIFF")
+    variants = [{"path": str(canonical), "canonical": True, "quality": .8,
+                 "profile": {"pitch_hz": 180, "spectral_centroid_hz": 2000, "rms": .05}}]
+    path, basis = select_reference({"source_performance": {}}, variants, canonical)
+    assert path == canonical and basis == "character bank"
+
+
+def test_the_delivery_master_opens_speaking_english(monkeypatch, tmp_path):
+    """Track 1 is the dub and it is the default; track 2 is the dialogue
+    soundtrack the pipeline worked from, even when the source put a commentary
+    track ahead of it."""
+    from app.services import pipeline
+
+    recorded: list[str] = []
+    monkeypatch.setattr(pipeline, "run", lambda *args, **kwargs: recorded.extend(args))
+    source, audio, output = tmp_path / "src.mkv", tmp_path / "dub.flac", tmp_path / "out.mkv"
+    # Stream 2 carried the dialogue; stream 1 is a commentary listed first.
+    pipeline.remux(source, audio, output, None, [2, 1])
+
+    maps = [recorded[i + 1] for i, item in enumerate(recorded) if item == "-map"]
+    assert maps[:4] == ["0:v?", "1:a:0", "0:2", "0:1"]
+
+    # The dub must be the one a player selects, without flattening the
+    # commentary and hearing-impaired flags on the tracks that follow it.
+    position = recorded.index("-disposition:a")
+    assert recorded[position + 1] == "-default"
+    assert recorded[recorded.index("-disposition:a:0") + 1] == "+default"
+    assert "0" not in (recorded[position + 1],)
+    assert recorded[recorded.index("-metadata:s:a:0") + 1] == "language=eng"
+
+
+def test_remux_falls_back_to_container_order_without_a_chosen_stream(monkeypatch, tmp_path):
+    from app.services import pipeline
+
+    recorded: list[str] = []
+    monkeypatch.setattr(pipeline, "run", lambda *args, **kwargs: recorded.extend(args))
+    pipeline.remux(tmp_path / "s.mkv", tmp_path / "d.flac", tmp_path / "o.mkv", None, [])
+    maps = [recorded[i + 1] for i, item in enumerate(recorded) if item == "-map"]
+    assert maps[:3] == ["0:v?", "1:a:0", "0:a?"]

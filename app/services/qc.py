@@ -40,6 +40,16 @@ def backtranscribe_lines(cues: list[dict], fitted_dir: Path, folder: Path,
     manifest = folder / "qc-asr-manifest.json"
     output = folder / "qc-backtranscription.json"
     items = [{"audio": str(fitted_dir / f"{index:06d}.wav")} for index in range(1, len(cues) + 1)]
+    # This reads the directory positionally, one take per cue. A caller that
+    # regenerated only some lines must fill the rest in first; say so here
+    # rather than surfacing it as an ffmpeg "no such file" three layers down.
+    missing = [Path(item["audio"]).name for item in items if not Path(item["audio"]).is_file()]
+    if missing:
+        raise RuntimeError(
+            f"Back-transcription needs one take per line in {fitted_dir}; "
+            f"{len(missing)} are missing (first: {missing[0]}). "
+            "Mirror the current takes into this directory before comparing."
+        )
     manifest.write_text(json.dumps({"items": items,
                                     "cache": str(Path(os.getenv("WHISPER_CACHE_DIR", "vendor/whisper")).resolve())},
                                    indent=2), encoding="utf-8")
@@ -253,8 +263,14 @@ def inspect_cues(cues: list[dict], fitted_dir: Path) -> dict:
             reasons.append("adapted translation needs a bilingual check")
         if float(metrics.get("active_duration") or 0.0) >= 0.8 and metrics.get("speaker_similarity") is None:
             reasons.append("QC evidence is missing: generated speaker similarity")
+        # A 0.8s take is far too short for a speaker embedding to mean anything:
+        # cropping one of our own takes to different lengths moves this score by
+        # up to 0.15 with no change of voice, and published verification error
+        # rises ~46% relatively between 3.6s and 2.0s utterances. Gate only on
+        # measurements long enough to carry speaker information rather than
+        # duration noise; shorter ones are still reported, just not judged.
         if (float(metrics.get("speaker_similarity") or 0.0) < 0.55
-                and float(metrics.get("active_duration") or 0.0) >= 0.8):
+                and metrics.get("speaker_similarity_reliable") is True):
             reasons.append("generated voice identity differs from the source reference")
         if metrics.get("tts_engine", "").startswith("Qwen3") and metrics.get("full_reference_clone") is not True:
             reasons.append("the fallback engine lacked a reference transcript and used reduced voice cloning")
@@ -324,8 +340,27 @@ def _stream_identity(stream: dict) -> dict:
         "channels": stream.get("channels"), "layout": stream.get("channel_layout"),
         "width": stream.get("width"), "height": stream.get("height"),
         "language": tags.get("language"), "title": tags.get("title"),
-        "disposition": {key: value for key, value in disposition.items() if value},
+        # The delivery master deliberately moves the default flag onto the
+        # English dub, so an audio stream that merely lost "default" has not
+        # been altered in any way that matters. Every other flag - commentary,
+        # hearing impaired, visual impaired, forced - must still survive, and
+        # english_dub_is_default below proves the flag landed where intended.
+        "disposition": {key: value for key, value in disposition.items()
+                        if value and not (stream.get("codec_type") == "audio" and key == "default")},
     }
+
+
+def _english_dub_is_default(streams: list[dict]) -> bool:
+    """The first audio track must be the English dub, and the one a player picks."""
+    audio = [item for item in streams if item.get("codec_type") == "audio"]
+    if not audio:
+        return False
+    first = audio[0]
+    if first.get("tags", {}).get("language") != "eng":
+        return False
+    if not first.get("disposition", {}).get("default"):
+        return False
+    return not any(item.get("disposition", {}).get("default") for item in audio[1:])
 
 
 def media_qc(output: Path, expected_duration: float, source: Path | None = None, checkpoint=None) -> dict:
@@ -398,7 +433,8 @@ def media_qc(output: Path, expected_duration: float, source: Path | None = None,
         "english_lossless_track": any(
             x.get("codec_type") == "audio" and x.get("codec_name") == "flac"
             and x.get("tags", {}).get("language") == "eng" for x in streams
-        ), **measured,
+        ),
+        "english_dub_is_default": _english_dub_is_default(streams), **measured,
     }
 
 
@@ -421,6 +457,8 @@ def evaluate_media_qc(media: dict, mastering: dict) -> list[str]:
         failures.append("source container metadata was not preserved")
     if not media.get("english_lossless_track"):
         failures.append("the English dub is not present as an English-labelled FLAC delivery track")
+    if not media.get("english_dub_is_default"):
+        failures.append("the English dub is not the first audio track and the one players select by default")
 
     measured_lufs = media.get("integrated_lufs")
     measured_peak = media.get("true_peak_dbtp")

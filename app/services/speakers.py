@@ -255,8 +255,34 @@ def build_reference_bank(dialogue_audio: Path, cues: list[dict], output_dir: Pat
             path.with_suffix(".json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2),
                                                   encoding="utf-8")
             references[speaker_id] = path
+            # The curated clip competes as a candidate in its own right, so a
+            # variant is measured against it rather than silently replacing it.
+            variants.setdefault(speaker_id, []).insert(0, {
+                "path": str(path), "canonical": True,
+                "profile": _clip_profile(montage, rate),
+                "reference_text": transcript,
+                "quality": float(metadata["quality"]),
+            })
     _write_variant_index(output_dir, variants)
     return references
+
+
+# Below this, a speaker-embedding comparison carries more duration noise than
+# speaker information, so it is reported but never used as a gate.
+RELIABLE_EMBEDDING_SECONDS = 2.0
+
+
+def _measured_seconds(path: Path) -> float:
+    try:
+        info = sf.info(path)
+        return float(info.frames) / float(info.samplerate or 1)
+    except Exception:
+        return 0.0
+
+
+VARIANT_QUALITY_FLOOR = .48
+VARIANT_SWITCH_MARGIN = 1.5
+VARIANT_ABSOLUTE_LIMIT = 4.0
 
 
 def _clip_profile(samples: np.ndarray, rate: int) -> dict:
@@ -292,7 +318,12 @@ def _acoustic_variants(reader, rate: int, pristine: list, selected: list, output
     take is, so the bank keeps spread and each line picks its nearest match.
     """
     keep = max(1, min(6, int(os.getenv("DUB_REFERENCE_VARIANTS", "4"))))
-    pool = (pristine or selected)[:24]
+    # Only clips good enough to have been the bank clip are eligible. A variant
+    # that matches a line's pitch but is short or noisy clones a worse voice
+    # than the curated take it would displace.
+    pool = [item for item in (pristine or selected)[:24]
+            if float(item[2].get("reference_quality", 0.0)) >= VARIANT_QUALITY_FLOOR
+            and float(item[2]["end"]) - float(item[2]["start"]) >= 2.0]
     chosen: list[dict] = []
     for _, cue_index, cue in pool:
         if len(chosen) >= keep:
@@ -303,7 +334,7 @@ def _acoustic_variants(reader, rate: int, pristine: list, selected: list, output
             continue
         reader.seek(start)
         samples = _vad_trim(reader.read(end - start, dtype="float32", always_2d=True).mean(axis=1), rate)
-        if len(samples) < rate * 0.8:
+        if len(samples) < rate * 2.0:
             continue
         profile = _clip_profile(samples, rate)
         if not profile["pitch_hz"]:
@@ -323,7 +354,8 @@ def _acoustic_variants(reader, rate: int, pristine: list, selected: list, output
             {"speaker_id": speaker_id, "reference_text": transcript, "cue_index": cue_index,
              "profile": profile}, ensure_ascii=False, indent=2), encoding="utf-8")
         chosen.append({"path": str(path), "cue_index": cue_index, "profile": profile,
-                       "reference_text": transcript})
+                       "reference_text": transcript,
+                       "quality": round(float(cue.get("reference_quality", 0.0)), 4)})
     return chosen
 
 
@@ -347,9 +379,11 @@ def load_reference_variants(output_dir: Path) -> dict[int, list[dict]]:
 def select_reference(cue: dict, variants: list[dict], default: Path) -> tuple[Path, str]:
     """Pick the take of this character that sounds most like this line.
 
-    Distance is measured in the units the ear cares about: pitch in semitones,
-    brightness in octaves, level in decibels.  Falls back to the canonical bank
-    clip whenever the line was never measured or nothing is close.
+    The bank clip is the curated one: chosen for cleanliness and length, and it
+    is what identity scoring measures against.  A variant therefore has to earn
+    its place -- it must be clearly closer to how this line was actually
+    delivered, not merely closer.  Matching the pitch of a line with a worse
+    recording clones a worse voice, which is a poor trade for a closer number.
     """
     performance = cue.get("source_performance") or {}
     pitch = float(performance.get("pitch_hz") or 0.0)
@@ -357,22 +391,38 @@ def select_reference(cue: dict, variants: list[dict], default: Path) -> tuple[Pa
         return default, "character bank"
     centroid = float(performance.get("spectral_centroid_hz") or 0.0)
     level = float(performance.get("rms") or 0.0)
-    best, best_distance = None, float("inf")
-    for item in variants:
-        profile = item.get("profile") or {}
+
+    def distance(profile: dict) -> float | None:
         candidate_pitch = float(profile.get("pitch_hz") or 0.0)
         if candidate_pitch <= 0:
-            continue
-        distance = abs(12 * math.log2(pitch / candidate_pitch))
+            return None
+        value = abs(12 * math.log2(pitch / candidate_pitch))
         candidate_centroid = float(profile.get("spectral_centroid_hz") or 0.0)
         if centroid > 0 and candidate_centroid > 0:
-            distance += abs(math.log2(centroid / candidate_centroid)) * 2.0
+            value += abs(math.log2(centroid / candidate_centroid)) * 2.0
         candidate_level = float(profile.get("rms") or 0.0)
         if level > 0 and candidate_level > 0:
-            distance += abs(20 * math.log10(level / candidate_level)) * .12
-        if distance < best_distance:
-            best, best_distance = item, distance
+            value += abs(20 * math.log10(level / candidate_level)) * .12
+        return value
+
+    baseline = None
+    for item in variants:
+        if item.get("canonical"):
+            baseline = distance(item.get("profile") or {})
+            break
+    best, best_distance = None, float("inf")
+    for item in variants:
+        if item.get("canonical"):
+            continue
+        value = distance(item.get("profile") or {})
+        if value is not None and value < best_distance:
+            best, best_distance = item, value
     if best is None:
+        return default, "character bank"
+    # Never swap for a marginal gain, and never for a poorer recording.
+    if baseline is not None and best_distance > baseline - VARIANT_SWITCH_MARGIN:
+        return default, "character bank"
+    if baseline is None and best_distance > VARIANT_ABSOLUTE_LIMIT:
         return default, "character bank"
     path = Path(str(best["path"]))
     if not path.is_file():
@@ -416,7 +466,17 @@ def score_speaker_similarity(cues: list[dict], generated_dir: Path,
         bank = banks.get(int(cue.get("speaker_id", 0))); line = generated_dir / f"{index:06d}.wav"
         value = embed(line) if bank is not None and line.is_file() else None
         if bank is not None and value is not None:
-            cue.setdefault("qc", {})["speaker_similarity"] = round(float(np.dot(bank, value)), 3)
+            metrics = cue.setdefault("qc", {})
+            metrics["speaker_similarity"] = round(float(np.dot(bank, value)), 3)
+            # Speaker-embedding scores are only meaningful above a couple of
+            # seconds: published verification results degrade ~46% relatively
+            # between 3.6s and 2.0s utterances, and cropping one of our own
+            # takes to different lengths moves this score by up to 0.15 with no
+            # change of voice at all. Record how far the measurement can be
+            # trusted so nothing downstream treats short-take noise as evidence.
+            seconds = _measured_seconds(line)
+            metrics["speaker_similarity_seconds"] = round(seconds, 2)
+            metrics["speaker_similarity_reliable"] = bool(seconds >= RELIABLE_EMBEDDING_SECONDS)
     del model
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

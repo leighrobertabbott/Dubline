@@ -56,7 +56,7 @@
         <div class="quick-grid">
           <article><span>01</span><h3>Choose the source</h3><p>Drop in one film, or use its full local path for a very large file. Add matching subtitle files only if you have them.</p></article>
           <article><span>02</span><h3>Confirm and start</h3><p>Optionally choose a section, add pronunciations, and ask Dubline to pause before voices. Confirm you have voice rights.</p></article>
-          <article><span>03</span><h3>Check the result</h3><p>Download immediately only when QC passed. If it says Needs review, inspect the report and correct the flagged lines first.</p></article>
+          <article><span>03</span><h3>Check the result</h3><p>Download straight away when the project reads <strong>Passed</strong>. If it reads <strong>Needs review</strong>, inspect the report and correct the flagged lines first.</p></article>
         </div>
       </section>
 
@@ -83,7 +83,7 @@
             </details>
             <details class="faq-item" id="film-section" data-search="clip section range start end full film test sample timestamp character scan">
               <summary><span>Can I dub only part of a film?</span><i></i></summary>
-              <div><p>Yes. Enter the section start, end, or both as <strong>MM:SS</strong> or <strong>HH:MM:SS</strong>. Leave both blank for the complete film. This is useful for a test scene.</p><p>Even for a section, Dubline can scan the original complete film for recurring-character evidence. That wider context helps it distinguish voices more reliably.</p></div>
+              <div><p>Yes. Enter the section start, end, or both as <strong>MM:SS</strong> or <strong>HH:MM:SS</strong>. Leave both blank for the whole film. This is useful for a test scene.</p><p>Even for a section, Dubline can scan the whole original film for recurring-character evidence. That wider context helps it distinguish voices more reliably.</p></div>
             </details>
             <details class="faq-item" id="rights" data-search="rights permission consent voice clone copyright commercial licence license">
               <summary><span>Why must I confirm voice rights?</span><i></i></summary>
@@ -107,7 +107,7 @@
             </details>
             <details class="faq-item" id="pause-resume" data-search="pause resume retry checkpoint restart crash close stop continue queued">
               <summary><span>Can I pause or recover a job?</span><i></i></summary>
-              <div><p>Yes. Pause asks the active stage to stop at a safe checkpoint; Resume continues from committed work. If processing stops with an error, use <strong>Retry from checkpoint</strong>. Dubline keeps cue sheets, references, completed takes and reusable stems so a restart does not intentionally begin from zero.</p><p>A queued job pauses immediately. An active model may need a short moment to reach its next safe control point.</p></div>
+              <div><p>Yes. Pause asks the active stage to stop at a safe checkpoint; Resume continues from committed work. If processing stops with an error, use <strong>Resume from checkpoint</strong>. Dubline keeps cue sheets, references, completed takes and reusable stems so a restart does not intentionally begin from zero.</p><p>A queued job pauses immediately. An active model may need a short moment to reach its next safe control point.</p></div>
             </details>
             <details class="faq-item" id="cancel" data-search="cancel delete remove project intermediate files storage">
               <summary><span>What does Cancel do?</span><i></i></summary>
@@ -118,7 +118,7 @@
           <section class="faq-group" data-group="review">
             <header><span>03</span><div><p>REVIEW &amp; QUALITY</p><h3>What “passed” means—and what it does not</h3></div></header>
             <details class="faq-item" id="qc-passed" data-search="qc passed complete quality checks green release automatic">
-              <summary><span>What does “QC passed” mean?</span><i></i></summary>
+              <summary><span>What does “Passed” mean?</span><i></i></summary>
               <div><p>It means every automatic line check and delivery check produced acceptable evidence: dialogue wording, speaker similarity, timing, performance measures, clipping, leakage, loudness, stream preservation and final-file structure.</p><p>It is a strong technical gate, not a promise of creative perfection. For a public or commercial release, a human should still watch and listen to the programme.</p></div>
             </details>
             <details class="faq-item" id="needs-review" data-search="needs review flagged warning output produced release unresolved evidence issue">
@@ -131,7 +131,7 @@
             </details>
             <details class="faq-item" id="approval-workflow" data-search="approval pause before voices transcript translation review pronunciation glossary">
               <summary><span>How do I review the translation before voices are generated?</span><i></i></summary>
-              <div><p>Open <strong>Review and pronunciation controls</strong> before starting and select the option to pause for review. Dubline completes dialogue analysis and translation, then waits before the lengthy voice stage. Edit the timeline as needed and choose <strong>Continue to voices</strong>.</p></div>
+              <div><p>Before starting, tick <strong>Hold before voicing</strong> in the Review row. Dubline completes dialogue analysis and translation, then waits before the lengthy voice stage. Correct any line, then choose <strong>Continue to voicing</strong>.</p></div>
             </details>
             <details class="faq-item" id="pronunciation" data-search="pronounce pronunciation glossary names acronym spelling spoken text">
               <summary><span>How does the pronunciation glossary work?</span><i></i></summary>

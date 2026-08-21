@@ -11,10 +11,33 @@ from pathlib import Path
 from app.services.llm import decode_json, load_llama, response_tokens, scrape_string_fields
 
 
+# Measured from real IndexTTS takes rendered at a natural rate (factor 0.95-1.10)
+# on this pipeline: 3.39 words/second. The previous 2.65 constant overstated
+# spoken length by ~28%, which made every duration target handed to the LLM too
+# generous and left hard_line() firing on nearly every cue.
+NATURAL_WORDS_PER_SECOND = 3.39
+# Isometric dubbing keeps each line within +/-10% of the length that fits its
+# window; IWSLT scores exactly this as "length compliance".
+LENGTH_TOLERANCE = 0.10
+
+
 def estimated_pace_seconds(text: str) -> float:
-    """Low-weight candidate prefilter; measured synthesis owns timing QC."""
+    """Predict spoken duration from text, calibrated against measured synthesis."""
     words = len(re.findall(r"[\w']+", text))
-    return max(0.35, words / 2.65 + text.count(",") * 0.08 + text.count(".") * 0.1)
+    return max(0.35, words / NATURAL_WORDS_PER_SECOND
+               + text.count(",") * 0.06 + text.count(".") * 0.08)
+
+
+def word_budget(target_seconds: float) -> tuple[int, int, int]:
+    """Words that fit a window at a natural rate, with the isometric band."""
+    ideal = max(1.0, target_seconds * NATURAL_WORDS_PER_SECOND)
+    return (max(1, round(ideal * (1 - LENGTH_TOLERANCE))), round(ideal),
+            max(1, round(ideal * (1 + LENGTH_TOLERANCE))))
+
+
+def length_ratio(text: str, target_seconds: float) -> float:
+    """How far this line is from fitting its window. 1.0 is exact."""
+    return estimated_pace_seconds(text) / max(target_seconds, .05)
 
 
 # Kept as a compatibility alias for cached manifests and external callers.
@@ -80,7 +103,11 @@ def choose_candidate(literal: str, candidates: list[str], target: float,
         terminology = float(evidence.get("terminology", 1.0 if index == 0 else 0.0))
         register = float(evidence.get("register", .9 if index == 0 else 0.0))
         missing_names = len([name for name in required_names if name.lower() not in candidate.lower()])
-        duration_error = min(1.5, abs(estimated_pace_seconds(candidate) - target) / target)
+        ratio = length_ratio(candidate, target)
+        # Inside the isometric band costs nothing; outside it grows sharply,
+        # because the synthesizer can only absorb so much before a line is
+        # warped or truncated.
+        duration_error = min(1.5, max(0.0, abs(ratio - 1.0) - LENGTH_TOLERANCE) * 3.0)
         rhythm_loss = 1 - rhythm_score(candidate, cue)
         mouth_visible = bool(cue.get("mouth_visible"))
         if mouth_visible:
@@ -164,17 +191,51 @@ def report(progress: float, index: int) -> None:
     print(json.dumps({"progress": max(0.0, min(1.0, progress)), "index": index}), flush=True)
 
 
+def scene_line(cues: list[dict], index: int) -> str:
+    """Render one scene line, refusing to privilege a transcript under dispute.
+
+    When two transcribers disagree the primary is not the source of truth, it is
+    one candidate reading.  Presenting it as SOURCE with the other buried in a
+    JSON blob asks the model to translate the error faithfully, which is exactly
+    what it then does.
+    """
+    cue = cues[index]
+    language = cue.get("source_language") or "unknown"
+    second = cue.get("asr_second_opinion") or {}
+    rows = []
+    if cue.get("source_asr_disputed") and str(second.get("text") or "").strip():
+        rows.append(f"{index} CONTESTED ({language}): two transcribers disagree on this line."
+                    " Neither reading is authoritative; choose the one the scene supports.")
+        rows.append(f"{index}   READING A (primary): {cue.get('source', '')}")
+        rows.append(f"{index}   READING B (independent, word confidence "
+                    f"{float(second.get('word_confidence') or 0):.2f}): {second.get('text', '')}")
+        english = str(second.get("english_translation") or "").strip()
+        if english:
+            rows.append(f"{index}   READING B already rendered in English: {english}")
+        rows.append(f"{index}   The primary transcriber mishears similar-sounding words;"
+                    " prefer the reading that is coherent in context.")
+    else:
+        rows.append(f"{index} SOURCE ({language}): {cue.get('source', '')}")
+        if str(second.get("text") or "").strip():
+            rows.append(f"{index} SECOND ASR OPINION (agrees): {second.get('text', '')}")
+    if cue.get("supplied_translation"):
+        rows.append(f"{index} SUPPLIED SUBTITLE (fallible evidence): {cue['supplied_translation']}")
+    if cue.get("translation_qc_feedback"):
+        rows.append(f"{index} PRIOR INDEPENDENT QC: {cue['translation_qc_feedback']}")
+    return chr(10).join(rows)
+
+
 def faithful_pass(llm, cues: list[dict]) -> None:
     batches = scene_batches(cues)
     for batch_number, batch in enumerate(batches, 1):
         untranslated = []
         for index in batch:
             cue = cues[index]
+            # Only a real distributor subtitle counts as supplied evidence.
+            # Back-filling this from english/literal_translation promoted the
+            # model's own previous output to "independent evidence", which then
+            # corroborated itself on every later pass and in the QC judge.
             supplied = cue.get("supplied_translation")
-            if not supplied and cue.get("translation_was_supplied"):
-                supplied = cue.get("english") or cue.get("literal_translation")
-            if supplied:
-                cue["supplied_translation"] = supplied
             cue["translation_was_supplied"] = bool(supplied or cue.get("translation_is_target", False))
             source_language = str(cue.get("source_language") or "").lower()
             source_needs_translation = source_language not in {"", "english"}
@@ -203,18 +264,9 @@ def faithful_pass(llm, cues: list[dict]) -> None:
         if not untranslated:
             report(FAITHFUL_SHARE * batch_number / max(1, len(batches)), batch[-1])
             continue
-        numbered = "\n".join(
-            f"{index} SOURCE ({cues[index].get('source_language') or 'unknown'}): "
-            f"{cues[index].get('source', '')}\n"
-            f"{index} SECOND ASR OPINION: "
-            f"{json.dumps(cues[index].get('asr_second_opinion') or {}, ensure_ascii=False)}\n"
-            f"{index} SUPPLIED SUBTITLE (fallible evidence): "
-            f"{cues[index].get('supplied_translation', '')}\n"
-            f"{index} PRIOR INDEPENDENT QC: {cues[index].get('translation_qc_feedback', '')}"
-            for index in batch
-        )
+        numbered = chr(10).join(scene_line(cues, index) for index in batch)
         wanted = ", ".join(str(index) for index in untranslated)
-        prompt = f"""Translate this complete film scene faithfully into idiomatic English from SOURCE.
+        prompt = f"""Translate this complete film scene faithfully into idiomatic English.
 Maintain names, terminology, facts, register, jokes, relationships and continuity across lines.
 The source transcript can contain homophone/recognition errors. A supplied professional subtitle is
 independent but fallible evidence: use scene continuity and both signals to resolve conflicts; do not
@@ -223,6 +275,10 @@ are condensed for reading speed: restore any action, object, quantity or clause 
 the source states, and remove anything the subtitle added that the source does not support. A high-confidence
 selective second ASR opinion is independent evidence and should resolve such a dispute. Do not shorten
 for timing and never romanize instead of translating.
+A line marked CONTESTED has no trusted transcript: weigh both readings against the scene and
+translate the one that actually makes sense, rather than defaulting to the primary.
+A line marked CONTESTED has no trusted transcript: weigh both readings against the scene and
+translate the one that actually makes sense rather than defaulting to the primary reading.
 Return only a JSON object mapping these requested line numbers to English strings: {wanted}
 Scene:
 {numbered}"""
@@ -246,7 +302,6 @@ Scene:
             if not translated:
                 continue
             cues[index]["faithful_translation"] = translated
-            cues[index]["literal_translation"] = translated
             cues[index]["english"] = translated
             cues[index]["translation_is_target"] = True
             cues[index]["translation_model"] = "Hy-MT2-7B Q4 · source-faithful v3"
@@ -281,13 +336,14 @@ def adaptation_pass(llm, cues: list[dict], output: Path) -> None:
                    if too_long else
                    f"A measured spoken take was {abs(previous_error):.1f}% too short; include fuller natural choices without adding meaning. "
                    if too_short else "")
+        budget_low, budget_ideal, budget_high = word_budget(target)
         prompt = f"""Adapt one already-translated film line for dubbing. Do not translate it again.
 Return strict JSON with six distinct versions:
 {{"natural":"...","compact":"...","fuller":"...","same_meaning":"...","rhythmic":"...","literal":"..."}}
 All values must be idiomatic English, never transliteration. Preserve meaning, names, facts and register.
 When the source transcript and supplied subtitle conflict, explicitly resolve the independent rejection
 below using the surrounding scene; do not merely paraphrase the rejected draft.
-{urgency}Target spoken duration: {target:.2f} seconds. The synthesizer will measure real duration afterward.
+{urgency}LENGTH BUDGET: this line is spoken in {target:.2f} seconds, which at a natural delivery is {budget_low}-{budget_high} words (aim for {budget_ideal}). Every version must land in that range: a line outside it cannot be spoken naturally in its slot and will be rewritten or cut. Shorten by removing padding and redundancy, never by dropping meaning.
 Mouth clearly visible: {bool(cue.get('mouth_visible'))}. When true, preserve the source line's starts, stops and emphasis points; do not claim phonetic lip matching.
 Source transcript: {cue.get('source', '')}
 Selective second ASR opinion: {json.dumps(cue.get('asr_second_opinion') or {}, ensure_ascii=False)}

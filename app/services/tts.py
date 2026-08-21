@@ -11,6 +11,26 @@ from typing import Callable
 from app.services.subprocess_control import controlled_lines, terminate_process
 
 
+# Human dubbers hold their speaking rate steady and let timing slip, rather than
+# the reverse: studies of professional localisation find dubbed speech has LOWER
+# rate variance than the source performance, and advise prioritising vocal
+# naturalness over strict isochrony. IndexTTS accepts 0.5-2.0, but anything near
+# those bounds is a warped-record artefact, so the pipeline never asks for it.
+# When a line genuinely will not fit, the words get rewritten -- not the speed.
+NATURAL_RATE_FLOOR = 0.86
+NATURAL_RATE_CEILING = 1.16
+
+
+def natural_duration_factor(value: float) -> float:
+    """Clamp a requested speaking rate to one a listener will accept."""
+    try:
+        floor = max(0.5, min(1.0, float(os.getenv("DUB_RATE_FLOOR", NATURAL_RATE_FLOOR))))
+        ceiling = min(2.0, max(1.0, float(os.getenv("DUB_RATE_CEILING", NATURAL_RATE_CEILING))))
+    except ValueError:
+        floor, ceiling = NATURAL_RATE_FLOOR, NATURAL_RATE_CEILING
+    return float(min(ceiling, max(floor, float(value))))
+
+
 EMOTION_ORDER = ["happy", "angry", "sad", "afraid", "disgusted", "melancholic", "surprised", "calm"]
 
 
@@ -107,7 +127,7 @@ class IndexTTSEngine:
         model = self._load()
         model.infer(
             spk_audio_prompt=str(reference_audio), text=text, lang=language, output_path=str(output),
-            duration_factor=min(2.0, max(0.5, float(duration_factor))), emo_vector=emotion_vector,
+            duration_factor=natural_duration_factor(duration_factor), emo_vector=emotion_vector,
             emo_audio_prompt=str(emotion_audio) if emotion_audio and emotion_vector is None else None,
             emo_alpha=emotion_strength,
             use_random=use_random, verbose=False,

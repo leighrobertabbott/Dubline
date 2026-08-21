@@ -12,6 +12,34 @@ def parse_json(text: str) -> list:
     return value if isinstance(value, list) else []
 
 
+SCORE_FIELDS = ("adequacy", "names", "register")
+
+
+def semantic_scores(value: dict) -> tuple[dict[str, float], bool]:
+    """Read the judge's scores, reporting whether it actually supplied any.
+
+    Small judges reliably fill the booleans and write a real reason, but often
+    echo whatever numbers the response schema showed them.  A silent echo used
+    to fail every line closed on a gate the translation never had a chance to
+    pass, so an unusable score set has to be recognised rather than believed.
+    """
+    scores: dict[str, float] = {}
+    for name in SCORE_FIELDS:
+        raw = value.get(name)
+        if raw is None:
+            continue
+        try:
+            number = float(raw)
+        except (TypeError, ValueError):
+            continue
+        # Accept both the 0-1 and 0-100 scales; only one is ever meant.
+        scores[name] = number / 100.0 if number > 1.0 else number
+    if len(scores) < len(SCORE_FIELDS):
+        return {name: scores.get(name, 0.0) for name in SCORE_FIELDS}, False
+    reported = any(scores[name] > 0.0 for name in SCORE_FIELDS)
+    return scores, reported
+
+
 def ask(llm, prompt: str, max_tokens: int = 900) -> str:
     response = llm.create_chat_completion(
         messages=[{"role": "user", "content": prompt}], temperature=0.0,
@@ -99,9 +127,11 @@ by the surrounding source—not stylistic wording or minor specificity. A fragme
 continues an adjacent line is not an omission. Detect
 changed facts, polarity, names, relationships, omissions, additions, mistranslated idioms and register
 changes. Do not reward fluency alone.
-Return only a JSON array, one object per ID:
-{{"id":1,"adequacy":0.0,"names":0.0,"register":0.0,"passed":false,"reason":"concise specific reason"}}
-Pass only when adequacy >= 0.78, names >= 0.85, and no material omission/addition exists.
+Return only a JSON array, one object per ID, in exactly this shape:
+[{{"id":<the ID>,"adequacy":<integer 0-100>,"names":<integer 0-100>,"register":<integer 0-100>,
+"passed":<true or false>,"reason":"<concise specific reason>"}}]
+Every score is your own integer judgement from 0 to 100. Never emit 0 unless the dub genuinely
+preserves nothing. Pass only when adequacy >= 78, names >= 85, and no material omission/addition exists.
 
 {lines}"""
         values = parse_json(ask(llm, prompt,
@@ -142,9 +172,12 @@ not against the subtitle. Equivalent paraphrases and synonyms pass. Changed pola
 enough versus insufficient, changed actor/action, quantities, names, intent, additions or omissions fail.
 If REFERENCE COMPLETE is false, evidence_sufficient must be false unless ordered secondary evidence makes
 the missing meaning unambiguous; do not pretend an incomplete fragment verifies a full sentence.
-Return only one JSON array:
-[{{"id":1,"adequacy":0.0,"names":0.0,"register":0.0,"contradiction":true,
-"evidence_sufficient":true,"reason":"specific English meaning comparison"}}]
+Return only one JSON array, one object per ID, in exactly this shape:
+[{{"id":<the ID>,"adequacy":<integer 0-100>,"names":<integer 0-100>,"register":<integer 0-100>,
+"contradiction":<true or false>,"evidence_sufficient":<true or false>,
+"reason":"<specific English meaning comparison>"}}]
+Every score is your own integer judgement from 0 to 100. Never emit 0 unless the dub preserves
+nothing of the reference meaning.
 {chr(10).join(comparison_lines)}"""
         comparison_values = parse_json(ask(llm, comparison_prompt,
             response_tokens(chr(10).join(comparison_lines), floor=800,
@@ -163,17 +196,27 @@ Return only one JSON array:
             item["semantic_reference"] = evidence.get("reference", "")
             item["semantic_reference_basis"] = evidence.get("basis", "")
             item["semantic_gate"] = semantic
-            item["adequacy"] = float(semantic.get("adequacy", 0.0))
-            item["names"] = float(semantic.get("names", 0.0))
-            item["register"] = float(semantic.get("register", 0.0))
+            scores, scores_reported = semantic_scores(semantic)
+            item["adequacy"] = round(scores["adequacy"], 3)
+            item["names"] = round(scores["names"], 3)
+            item["register"] = round(scores["register"], 3)
+            item["scores_reported"] = scores_reported
             item["reason"] = str(semantic.get("reason") or item.get("reason")
                                  or "independent semantic gate returned no reason")
             item["available"] = True
             item["model"] = "Qwen3-8B Q4 independent bilingual judge"
             item["revision"] = str(spec.get("judge_revision") or "unknown")
-            item["passed"] = (bool(semantic.get("evidence_sufficient"))
-                              and not bool(semantic.get("contradiction"))
-                              and item["adequacy"] >= .78 and item["names"] >= .85)
+            findings_pass = (bool(semantic.get("evidence_sufficient"))
+                             and not bool(semantic.get("contradiction")))
+            if scores_reported:
+                item["passed"] = findings_pass and item["adequacy"] >= .78 and item["names"] >= .85
+                item["verdict_basis"] = "judge findings and scores"
+            else:
+                # No usable scores came back. Judging on the findings the model
+                # did make is weaker evidence than a full verdict, so say so
+                # rather than silently rejecting a sound translation.
+                item["passed"] = findings_pass
+                item["verdict_basis"] = "judge findings only; it returned no usable scores"
             results.append(item)
         completed += len(batch)
         args.output.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

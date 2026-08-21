@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from app.services.media_identity import CatalogueClient, MediaLibrary, parse_media_filename, score_candidate
@@ -110,3 +111,42 @@ def test_managed_application_key_is_added_without_bearer_header(monkeypatch):
     client = CatalogueClient()
     assert client.tmdb_available
     assert client._tmdb_url("https://example.test/search?q=film").endswith("q=film&api_key=application-key")
+
+
+def test_the_bundled_token_fills_an_empty_slot_but_never_beats_the_user(monkeypatch, tmp_path):
+    # Released builds carry Dubline's own TMDB credential so a non-technical
+    # user gets covers with no account.  It must sit underneath everything else.
+    from app import config
+
+    blank_env = tmp_path / ".env"
+    blank_env.write_text("DUBLINE_TMDB_TOKEN=\n", encoding="utf-8")
+    monkeypatch.setattr(config, "BUNDLED_TMDB_TOKEN", "shipped-application-token")
+
+    for name in ("TMDB_TOKEN", "DUBLINE_TMDB_TOKEN", "DUBLINE_TMDB_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    config.load_local_environment(blank_env)
+    summary = config.media_lookup_summary()
+    assert summary["managed"] is True
+    assert summary["movie_lookup"] is True
+    assert summary["display"] == "Included with Dubline"
+    assert CatalogueClient().token == "shipped-application-token"
+
+    # A token the user saved in Setup outranks the shipped one.
+    monkeypatch.setenv("TMDB_TOKEN", "a-personal-token-of-sufficient-length")
+    personal = config.media_lookup_summary()
+    assert personal["managed"] is False
+    assert CatalogueClient().token == "a-personal-token-of-sufficient-length"
+
+
+def test_a_fork_without_a_bundled_token_still_looks_up_television(monkeypatch, tmp_path):
+    from app import config
+
+    monkeypatch.setattr(config, "BUNDLED_TMDB_TOKEN", "")
+    for name in ("TMDB_TOKEN", "DUBLINE_TMDB_TOKEN", "DUBLINE_TMDB_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    config.load_local_environment(tmp_path / "absent.env")
+    summary = config.media_lookup_summary()
+    assert summary["managed"] is False
+    assert summary["movie_lookup"] is False
+    assert summary["tv_lookup"] is True
+    assert "DUBLINE_TMDB_TOKEN" not in os.environ

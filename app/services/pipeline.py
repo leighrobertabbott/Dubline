@@ -14,7 +14,7 @@ import time
 import statistics
 import hashlib
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from app.services.cinematic import recover_roformer, recover_vocals, separate_cinematic_audio
 from app.services.analysis_cache import media_fingerprint, restore_json_artifact, store_json_artifact
@@ -47,9 +47,15 @@ from app.store import JobStore
 
 SAMPLE_RATE = 24_000
 # Conditioning strength when the emotion prompt is the actor's own delivery of
-# this exact line, and the stronger value a retake escalates to.
-SOURCE_EMOTION_STRENGTH = 0.85
-RETAKE_EMOTION_STRENGTH = 1.0
+# this exact line, and the value a retake escalates to.
+#
+# Raising this above 0.6 was an untested judgement call and coincided with a
+# measured fall in speaker similarity (0.755 -> 0.700 on the same clip), so it
+# is back at the value that produced the better identity. Stronger emotion
+# conditioning appears to pull timbre away from the speaker; re-raise it only
+# with a same-clip measurement showing it does not.
+SOURCE_EMOTION_STRENGTH = 0.6
+RETAKE_EMOTION_STRENGTH = 0.8
 _whisper_models: dict[str, object] = {}
 _whisper_lock = threading.Lock()
 _run_context = threading.local()
@@ -1147,6 +1153,7 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             retake_cues = copy.deepcopy(cues)
             for index, metrics in retake_metrics.items():
                 retake_cues[index].setdefault("qc", {}).update(metrics)
+            mirror_current_takes(fitted, retake_dir, total)
             retake_qc = folder / "performance-retake-qc"; retake_qc.mkdir(exist_ok=True)
             with gpu_stage(folder, "Whisper performance-retake QC", checkpoint):
                 backtranscribe_lines(retake_cues, retake_dir, retake_qc,
@@ -1188,11 +1195,7 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             update(81.45, f"Comparing a second speech engine for {len(fallback_failures)} difficult line(s)")
             qwen_dir = folder / "qwen-fitted"; qwen_raw = folder / "qwen-generated"
             qwen_dir.mkdir(exist_ok=True); qwen_raw.mkdir(exist_ok=True)
-            for index in range(total):
-                source_line = fitted / f"{index + 1:06d}.wav"
-                target_line = qwen_dir / source_line.name
-                if source_line.is_file() and not target_line.is_file():
-                    shutil.copy2(source_line, target_line)
+            mirror_current_takes(fitted, qwen_dir, total)
             qwen_items = []
             qwen_metrics: dict[int, dict] = {}
             for index in fallback_failures:
@@ -1302,7 +1305,13 @@ def run_pipeline(job_id: str, store: JobStore) -> None:
             log(f"MuseTalk finishing selected {lipsync_summary['selected']} clean visible shot(s); "
                 f"completed {lipsync_summary['completed']}")
         update(95, "Rejoining the full-length video")
-        remux(source, mixed, output, video_override)
+        # The dialogue soundtrack becomes track 2, ahead of any commentary or
+        # description track that happened to sit earlier in the container.
+        original_order = [working_audio["index"]] + [
+            stream["index"] for stream in available_audio
+            if stream["index"] != working_audio["index"]
+        ] if working_audio else []
+        remux(source, mixed, output, video_override, original_order)
         update(98, "Verifying the finished film and writing its QC report")
         final_qc = media_qc(
             output, duration, source, checkpoint,
@@ -1557,6 +1566,11 @@ def reconcile_subtitles_with_asr(subtitles: list[dict], asr: list[dict]) -> list
             "start": round(speech_start, 3), "end": round(speech_end, 3),
             "subtitle_start": round(start, 3), "subtitle_end": round(end, 3),
             "source": source_text or text, "literal_translation": text,
+            # The distributor's own translation, recorded where nothing
+            # downstream can overwrite it. Every later stage treats this as
+            # independent human evidence, so it must never be back-filled from
+            # a machine translation of the same line.
+            "supplied_translation": text,
             "english": text, "adapted_dialogue": text, "words": words,
             "translation_is_target": True,
             "source_language": matching[0].get("source_language") if matching else None,
@@ -1787,6 +1801,25 @@ def _measure(value, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def mirror_current_takes(fitted: Path, comparison: Path, total: int) -> int:
+    """Fill a comparison directory so it holds one take per line.
+
+    The QC and similarity passes read a whole directory positionally, one file
+    per cue.  A directory holding only the lines that were regenerated makes
+    them fail on the first line that was not, so every other line is carried
+    across as its current take and only the regenerated files differ.
+    """
+    comparison.mkdir(parents=True, exist_ok=True)
+    mirrored = 0
+    for index in range(total):
+        current = fitted / f"{index + 1:06d}.wav"
+        target = comparison / current.name
+        if current.is_file() and not target.is_file():
+            shutil.copy2(current, target)
+            mirrored += 1
+    return mirrored
 
 
 def second_asr_evidence_candidates(cues: list[dict]) -> list[dict]:
@@ -2362,17 +2395,36 @@ def master_audio(premaster: Path, output: Path, dialogue: Path, preset: str,
     return result
 
 
-def remux(source: Path, audio: Path, output: Path, video_override: Path | None = None) -> None:
+def remux(source: Path, audio: Path, output: Path, video_override: Path | None = None,
+          original_order: Sequence[int] = ()) -> None:
+    """Mux the delivery master with the English dub as the first audio track.
+
+    Track 1 is the dub and track 2 is the original dialogue soundtrack the
+    pipeline actually worked from, which is not always the source's first audio
+    stream: plenty of releases put a commentary track ahead of the programme.
+    Remaining source audio follows in its original order.
+    """
     inputs = ["-i", str(source), "-i", str(audio)]
     video_map = "0:v?"
     if video_override and video_override.is_file():
         inputs += ["-i", str(video_override)]
         video_map = "2:v:0"
+    # An explicit order is used when the caller knows which stream carried the
+    # dialogue; otherwise fall back to whatever order the container lists.
+    original_maps: list[str] = []
+    for index in original_order:
+        original_maps += ["-map", f"0:{index}"]
+    if not original_maps:
+        original_maps = ["-map", "0:a?"]
     run("ffmpeg", "-y", "-v", "error", *inputs,
-        "-map", video_map, "-map", "1:a:0", "-map", "0:a?", "-map", "0:s?", "-map", "0:d?", "-map", "0:t?",
+        "-map", video_map, "-map", "1:a:0", *original_maps,
+        "-map", "0:s?", "-map", "0:d?", "-map", "0:t?",
         "-map_metadata", "0", "-map_chapters", "0", "-c", "copy",
         "-metadata:s:a:0", "language=eng", "-metadata:s:a:0", "title=English AI Dub · FLAC delivery master",
-        "-disposition:a:0", "0", str(output))
+        # Clear only the default flag across the audio tracks, then raise it on
+        # the dub, so a player opens speaking English. Wiping dispositions
+        # wholesale would also strip commentary and hearing-impaired flags.
+        "-disposition:a", "-default", "-disposition:a:0", "+default", str(output))
 
 
 def format_duration(seconds: float) -> str:

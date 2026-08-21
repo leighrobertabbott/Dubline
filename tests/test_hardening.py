@@ -371,6 +371,10 @@ def test_remux_preserves_source_stream_identity_and_disposition(tmp_path: Path):
     assert evidence["streams_preserved_exactly"]
     assert evidence["metadata_preserved"]
     assert evidence["english_lossless_track"]
+    # Track 1 is the dub and it is the track a player opens on; the original
+    # keeps every other flag it arrived with.
+    assert evidence["english_dub_is_default"]
+    assert not evaluate_media_qc(evidence, {"program_gain_db": 0.0})
 
 def test_no_service_module_references_an_unimported_name():
     """Guard against a name that only fails once a worker is deep into a job.

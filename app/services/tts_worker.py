@@ -14,7 +14,7 @@ import numpy as np
 import soundfile as sf
 
 from app.services.gpu_safety import query_nvidia
-from app.services.tts import IndexTTSEngine
+from app.services.tts import IndexTTSEngine, natural_duration_factor
 
 
 def synthesis_input_signature(item: dict) -> str:
@@ -241,7 +241,10 @@ def main() -> None:
             if best_error <= max(.025, fit_limit / 100 * .55):
                 break
             retry = raw.with_name(raw.stem + f".retry-{retry_number}.wav")
-            factor = float(np.clip(factor * desired_span / max(span, .08), .5, 2.0))
+            # Searching the full 0.5-2.0 range is what produced half-speed
+            # vowels; a line that will not fit at a natural rate is a
+            # translation problem, and the timing-QC rewrite owns it.
+            factor = natural_duration_factor(factor * desired_span / max(span, .08))
             engine.synthesize(
                 item["text"], Path(item["reference"]), retry, target,
                 item.get("emotion_vector"), float(item["emotion_strength"]),

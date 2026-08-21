@@ -175,20 +175,54 @@ Dubline can be configured via environment variables or by creating a `.env` file
 | `DUB_ENGINE` | `indextts` | Primary TTS engine (`indextts` or `qwen-tts`) |
 | `DUB_WORKDIR` | `./data` | Working directory for job stems and temporary files |
 | `DUB_DIARIZATION_DEVICE` | `cuda` | Hardware device for diarization (`cuda` or `cpu`) |
-| `DUB_LLAMA_GPU_LAYERS` | `24` | CUDA-heavy partial offload for laptop-safe LLM adaptation (`-1` = full offload) |
-| `DUB_GPU_ABORT_TEMPERATURE_C` | `90` | Last-resort stop above this laptop GPU's locally reported 87°C firmware target |
+| `WHISPER_MODEL` | `turbo` | Whisper model used to re-read source dialogue for verification |
+| `TRANSLATION_MODEL` | `./vendor/hy-mt2-7b/...` | GGUF used for translation; the GPU split is sized automatically |
+| `TRANSLATION_QC_MODEL` | `./vendor/qwen3-8b/...` | GGUF used by the translation QC judge |
+| `DUB_LLAMA_GPU_LAYERS` | `auto` | Reads the GGUF's real block count and offloads as many layers as measurably fit. Integer to override, `0` to keep the model in system RAM |
+| `DUB_LLAMA_VRAM_HEADROOM_MB` | `400` | VRAM left free when sizing that automatic split |
+| `DUB_REFERENCE_VARIANTS` | `4` | Acoustically distinct reference takes kept per character, so each line clones from the closest delivery |
+| `DUB_SOURCE_VERIFY_MAX_LINES` | `1500` | Budget for second-pass Whisper verification, spent on the least reliable lines first |
+| `INDEXTTS_DIFFUSION_STEPS` | `25` | IndexTTS flow-refinement steps. Lower trades voice quality for speed |
+| `DUB_GPU_ABORT_TEMPERATURE_C` | `90` | Hard stop: abort the CUDA stage above this GPU temperature |
+| `DUB_GPU_SOFT_TEMPERATURE_C` | `80` | Begin yielding between synthesized lines before the hard abort is reached |
+| `DUB_GPU_COOLDOWN_TARGET_C` | `77` | Resume line generation once proactive cooling reaches this target |
 | `DUB_GPU_WATCHDOG_SECONDS` | `0.5` | Interval for active NVIDIA health monitoring during every CUDA stage |
-| `DUB_GPU_SOFT_TEMPERATURE_C` | `72` | Begin yielding between synthesized lines before the hard watchdog is reached |
-| `DUB_GPU_COOLDOWN_TARGET_C` | `69` | Resume line generation after proactive cooling reaches this target |
-| `DUB_GPU_LINE_COOLDOWN_SECONDS` | `1.0` | Minimum idle handoff between synthesized dialogue lines |
-| `INDEXTTS_DIFFUSION_STEPS` | `16` | Thermal-safe IndexTTS 2.5 flow refinement on this laptop (`25` restores upstream maximum) |
+| `DUB_GPU_LINE_SETTLE_SECONDS` | `0.15` | Brief settle between lines so consecutive bursts do not stack |
+| `DUB_GPU_LINE_COOLDOWN_LIMIT_SECONDS` | `45` | Maximum wait for the temperature target before continuing anyway |
 | `DUB_GPU_AUTO_RESUME_LIMIT` | `12` | Maximum automatic thermal resumptions before leaving a job paused for review |
 | `DUB_GPU_AUTO_RESUME_TIMEOUT_SECONDS` | `600` | How long to wait for a cool, idle, released GPU before requiring manual resume |
 | `BANDIT_CHECKPOINT` | `./vendor/...` | Path to Bandit v2 separation checkpoint |
 | `MUSETALK_ENABLED` | `0` | Enable optional generative visual lip-sync pass (`0` or `1`) |
+| `MUSETALK_MAX_SHOTS` | `6` | Maximum close-up shots the optional lip-sync pass will touch |
 | `HF_TOKEN` | *None* | Optional Hugging Face token for gated models (e.g. pyannote) |
 | `MEDIA_LOOKUP_ENABLED` | `1` | Use local metadata/artwork first, then optional title-only catalogue matching |
-| `DUBLINE_TMDB_TOKEN` | release managed | Application catalogue credential injected by official builds; ordinary users do not need to provide it |
+| `DUBLINE_TMDB_TOKEN` | bundled | Overrides the TMDB application token Dubline ships with. Ordinary users never set this |
+
+### Catalogue artwork and titles
+
+Dubline looks for a title and cover in this order, and stops at the first hit:
+
+1. A sibling `.nfo` file (Kodi's format) and a local `poster.jpg` / `folder.jpg`
+2. TMDB, using the application token Dubline ships with
+3. TVmaze for television, which needs no credential at all
+
+Steps 1 and 3 require nothing. Step 2 uses a TMDB token bundled in
+[`app/config.py`](app/config.py) as `BUNDLED_TMDB_TOKEN`, so that a person who
+just wants to dub a film never has to register an account -- the same
+arrangement Kodi's official scraper addon uses.
+
+**Maintainer notes.** That token is public: anyone who downloads Dubline can
+read it. Create one solely for Dubline, use it for nothing else, and treat it as
+disposable. Every install shares its rate limit, which is why artwork is cached
+per project and each title is looked up once. If TMDB throttles or revokes it,
+paste a replacement into `BUNDLED_TMDB_TOKEN` and cut a release.
+
+**Forks.** Leave `BUNDLED_TMDB_TOKEN` empty. Local `.nfo`/artwork and TV lookups
+keep working, and *Setup > Optional extras > Developer catalogue override* lets
+you paste your own token for film matching.
+
+Only a cleaned title, year and episode number ever leave the machine, and only
+when `MEDIA_LOOKUP_ENABLED=1`. Media, audio and rendering never do.
 
 ---
 
